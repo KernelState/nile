@@ -13,7 +13,6 @@ const wlr = @import("wlroots");
 const wayland = @import("wayland");
 const wl = wayland.server.wl;
 const zwlr = wayland.server.zwlr;
-const river = wayland.server.river;
 
 const server = &@import("main.zig").server;
 const util = @import("util.zig");
@@ -137,7 +136,6 @@ const RenderingState = struct {
 wlr_output: ?*wlr.Output,
 scene_output: ?*wlr.SceneOutput,
 
-object: ?*river.OutputV1 = null,
 layer_shell: LayerShellOutput = .{},
 
 /// Tracks the currently presented frame on the output as it pertains to ext-session-lock.
@@ -165,12 +163,11 @@ lock_render_state: enum {
 link: wl.list.Link,
 
 /// State to be sent to the wm in the next manage sequence.
-scheduled: State,
-/// State sent to the wm in the latest manage sequence.
-sent: State,
-link_sent: wl.list.Link,
-sent_wl_output: bool = false,
-/// Rendering state requested by the window manager.
+    scheduled: State,
+    /// State sent to the wm in the latest manage sequence.
+    sent: State,
+    link_sent: wl.list.Link,
+    /// Rendering state requested by the window manager.
 rendering_requested: RenderingState = .init,
 /// State applied to the wlr_output and rendered.
 current: State,
@@ -321,53 +318,7 @@ pub fn manageStart(output: *Output) void {
             // We cannot send 0 width/height to the window manager client.
             assert(output.scheduled.mode != .none);
 
-            const wlr_output = output.wlr_output.?;
-
             output.layer_shell.manageStart();
-
-            if (server.wm.object) |wm_v1| {
-                const new = output.object == null;
-                const output_v1 = output.object orelse blk: {
-                    const output_v1 = river.OutputV1.create(wm_v1.getClient(), wm_v1.getVersion(), 0) catch {
-                        log.err("out of memory", .{});
-                        return; // try again next update
-                    };
-                    output.object = output_v1;
-
-                    output_v1.setHandler(*Output, handleRequest, handleObjectDestroy, output);
-                    wm_v1.sendOutput(output_v1);
-
-                    break :blk output_v1;
-                };
-                errdefer comptime unreachable;
-
-                if (!output.sent_wl_output) {
-                    // wl_output globals are created/destroyed by the wlroots output layout.
-                    if (wlr_output.global) |global| {
-                        output_v1.sendWlOutput(global.getName(output_v1.getClient()));
-                        output.sent_wl_output = true;
-                    }
-                }
-
-                const scheduled = &output.scheduled;
-                const sent = &output.sent;
-
-                const scheduled_width, const scheduled_height = scheduled.dimensions();
-                const sent_width, const sent_height = sent.dimensions();
-
-                if (new or scheduled_width != sent_width or scheduled_height != sent_height) {
-                    output_v1.sendDimensions(scheduled_width, scheduled_height);
-                }
-                if (new or scheduled.x != sent.x or scheduled.y != sent.y) {
-                    output_v1.sendPosition(scheduled.x, scheduled.y);
-                }
-
-                if (new or scheduled.capture_session_count != sent.capture_session_count) {
-                    if (output_v1.getVersion() >= 5) {
-                        output_v1.sendCaptureSessions(scheduled.capture_session_count);
-                    }
-                }
-            }
 
             output.sent = output.scheduled;
 
@@ -407,47 +358,7 @@ pub fn manageStart(output: *Output) void {
 }
 
 pub fn makeInert(output: *Output) void {
-    if (output.object) |output_v1| {
-        output_v1.sendRemoved();
-        output_v1.setHandler(?*anyopaque, handleRequestInert, null, null);
-        output.layer_shell.makeInert();
-        handleObjectDestroy(output_v1, output);
-    }
-}
-
-fn handleRequestInert(
-    output_v1: *river.OutputV1,
-    request: river.OutputV1.Request,
-    _: ?*anyopaque,
-) void {
-    if (request == .destroy) output_v1.destroy();
-}
-
-fn handleObjectDestroy(_: *river.OutputV1, output: *Output) void {
-    output.object = null;
-    output.sent_wl_output = false;
-}
-
-fn handleRequest(
-    output_v1: *river.OutputV1,
-    request: river.OutputV1.Request,
-    output: *Output,
-) void {
-    assert(output.object == output_v1);
-    switch (request) {
-        .destroy => output_v1.destroy(),
-        .set_presentation_mode => |args| {
-            if (!server.wm.ensureRendering()) return;
-            output.rendering_requested.tearing = switch (args.mode) {
-                .vsync => false,
-                .async => true,
-                _ => {
-                    output_v1.postError(.invalid_presentation_mode, "invalid presentation mode enum value");
-                    return;
-                },
-            };
-        },
-    }
+    output.layer_shell.makeInert();
 }
 
 fn handleRequestState(listener: *wl.Listener(*wlr.Output.event.RequestState), event: *wlr.Output.event.RequestState) void {

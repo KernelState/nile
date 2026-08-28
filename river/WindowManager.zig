@@ -7,7 +7,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 const wl = @import("wayland").server.wl;
 const wlr = @import("wlroots");
-const river = @import("wayland").server.river;
 const SlotMap = @import("slotmap").SlotMap;
 
 const server = &@import("main.zig").server;
@@ -22,11 +21,11 @@ const WmNode = @import("WmNode.zig");
 
 const log = std.log.scoped(.wm);
 
-global: *wl.Global,
+/// Legacy Wayland global - disabled by default. Nile uses direct functions.
+/// See `Nile.zig` and `doc/nile-api.md`. Set to non-null only if you need
+/// compatibility with old external window managers.
+global: ?*wl.Global = null,
 server_destroy: wl.Listener(*wl.Server) = .init(handleServerDestroy),
-
-/// The protocol object of the active window manager, if any.
-object: ?*river.WindowManagerV1 = null,
 
 state: union(enum) {
     idle,
@@ -84,7 +83,9 @@ pub fn init(wm: *WindowManager) !void {
     errdefer timeout.remove();
 
     wm.* = .{
-        .global = try wl.Global.create(server.wl_server, river.WindowManagerV1, 5, *WindowManager, wm, bind),
+        .global = null, // Nile: legacy river_window_manager_v1 global disabled
+        // To re-enable for compatibility with old WMs, uncomment:
+        // .global = try wl.Global.create(server.wl_server, river.WindowManagerV1, 5, *WindowManager, wm, bind),
         .sent = .{
             .outputs = undefined,
             .seats = undefined,
@@ -98,143 +99,31 @@ pub fn init(wm: *WindowManager) !void {
     wm.sent.seats.init();
     wm.rendering_requested.list.init();
 
+    // Only add legacy init if global is enabled. For Nile, window management
+    // is done via direct function calls in `Nile.zig` without a Wayland client.
+    // The transaction system (manage/render) still runs, but is driven by
+    // `Nile.dirtyWindowing()` / `dirtyRendering()` rather than protocol messages.
     server.wl_server.addDestroyListener(&wm.server_destroy);
 }
 
 fn handleServerDestroy(listener: *wl.Listener(*wl.Server), _: *wl.Server) void {
     const wm: *WindowManager = @fieldParentPtr("server_destroy", listener);
 
-    wm.global.destroy();
+    if (wm.global) |g| g.destroy();
     wm.timeout.remove();
-}
-
-fn bind(client: *wl.Client, wm: *WindowManager, version: u32, id: u32) void {
-    const object = river.WindowManagerV1.create(client, version, id) catch {
-        client.postNoMemory();
-        log.err("out of memory", .{});
-        return;
-    };
-
-    if (wm.object != null) {
-        object.sendUnavailable();
-        object.setHandler(?*anyopaque, handleRequestInert, null, null);
-        return;
-    }
-
-    wm.object = object;
-    object.setHandler(*WindowManager, handleRequest, handleDestroy, wm);
-    wm.dirtyWindowing();
-}
-
-fn handleRequestInert(
-    object: *river.WindowManagerV1,
-    request: river.WindowManagerV1.Request,
-    _: ?*anyopaque,
-) void {
-    if (request == .destroy) object.destroy();
-}
-
-fn handleDestroy(_: *river.WindowManagerV1, wm: *WindowManager) void {
-    log.debug("active river_window_manager_v1 destroyed", .{});
-    wm.object = null;
-    wm.sent.session_locked = false;
-    {
-        var it = server.om.outputs.iterator(.forward);
-        while (it.next()) |output| output.makeInert();
-    }
-    {
-        var it = server.input_manager.seats.iterator(.forward);
-        while (it.next()) |seat| seat.makeInert();
-    }
-    {
-        var it = wm.windows.iterator();
-        while (it.next()) |window| window.makeInert();
-    }
-    switch (wm.state) {
-        .idle => {},
-        .inflight_configures => {},
-        .manage => wm.manageFinish(),
-        .render => wm.renderFinish(),
-    }
-}
-
-fn handleRequest(
-    wm_v1: *river.WindowManagerV1,
-    request: river.WindowManagerV1.Request,
-    wm: *WindowManager,
-) void {
-    assert(wm.object == wm_v1);
-    switch (request) {
-        .stop => {
-            handleDestroy(wm_v1, wm);
-            wm_v1.sendFinished();
-            wm_v1.setHandler(?*anyopaque, handleRequestInert, null, null);
-        },
-        // TODO send protocol error to avoid leak on race
-        .destroy => wm_v1.destroy(),
-        .manage_finish => {
-            if (wm.state != .manage) {
-                wm_v1.postError(.sequence_order,
-                    \\manage_finish request does not match manage_start
-                );
-                return;
-            }
-            wm.manageFinish();
-        },
-        .manage_dirty => {
-            wm.scheduled.dirty_lazy = true;
-            wm.addDirtyIdle();
-        },
-        .render_finish => {
-            if (wm.state != .render) {
-                wm_v1.postError(.sequence_order,
-                    \\render_finish request does not match render_start
-                );
-                return;
-            }
-            wm.renderFinish();
-        },
-        .get_shell_surface => |args| {
-            const surface = wlr.Surface.fromWlSurface(args.surface);
-            ShellSurface.create(
-                wm_v1.getClient(),
-                wm_v1.getVersion(),
-                args.id,
-                surface,
-            ) catch {
-                wm_v1.getClient().postNoMemory();
-                log.err("out of memory", .{});
-                return;
-            };
-        },
-        .exit_session => {
-            log.info("window manager requested to exit session", .{});
-            server.wl_server.terminate();
-        },
-    }
 }
 
 pub fn ensureWindowing(wm: *WindowManager) bool {
     switch (wm.state) {
         .manage => return true,
-        .idle, .inflight_configures, .render => {
-            if (wm.object) |wm_v1| {
-                wm_v1.postError(.sequence_order, "invalid modification of window management state");
-            }
-            return false;
-        },
+        .idle, .inflight_configures, .render => return false,
     }
 }
 
 pub fn ensureRendering(wm: *WindowManager) bool {
     switch (wm.state) {
         .manage, .inflight_configures, .render => return true,
-        .idle => {
-            if (wm.object) |wm_v1| {
-                wm_v1.postError(.sequence_order, "invalid modification of rendering state");
-            }
-            return false;
-        },
+        .idle => return false,
     }
 }
 
@@ -311,13 +200,6 @@ fn manageStart(wm: *WindowManager) void {
 
     const session_locked = server.lock_manager.state == .locked;
     if (session_locked != wm.sent.session_locked) {
-        if (wm.object) |wm_v1| {
-            if (session_locked) {
-                wm_v1.sendSessionLocked();
-            } else {
-                wm_v1.sendSessionUnlocked();
-            }
-        }
         wm.sent.session_locked = session_locked;
     }
 
@@ -341,11 +223,7 @@ fn manageStart(wm: *WindowManager) void {
         while (it.next()) |seat| seat.manageStart();
     }
 
-    if (wm.object) |wm_v1| {
-        wm_v1.sendManageStart();
-    } else {
-        wm.manageFinish();
-    }
+    wm.manageFinish();
 }
 
 pub fn manageFinish(wm: *WindowManager) void {
@@ -431,11 +309,7 @@ fn renderStart(wm: *WindowManager) void {
         }
     }
 
-    if (wm.object) |wm_v1| {
-        wm_v1.sendRenderStart();
-    } else {
-        wm.renderFinish();
-    }
+    wm.renderFinish();
 }
 
 /// Finish the update sequence and drop stashed buffers. This means that

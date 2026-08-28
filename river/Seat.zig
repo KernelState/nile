@@ -6,11 +6,9 @@ const Seat = @This();
 const build_options = @import("build_options");
 const std = @import("std");
 const assert = std.debug.assert;
-const math = std.math;
 const wlr = @import("wlroots");
 const wayland = @import("wayland");
 const wl = wayland.server.wl;
-const river = wayland.server.river;
 const xkb = @import("xkbcommon");
 
 const server = &@import("main.zig").server;
@@ -165,7 +163,6 @@ link: wl.list.Link,
 
 destroying: bool = false,
 
-object: ?*river.SeatV1 = null,
 layer_shell: LayerShellSeat = .{},
 xkb_bindings_seat: XkbBindingsSeat = .{},
 
@@ -287,7 +284,11 @@ pub fn create(name: [*:0]const u8) !void {
 }
 
 pub fn destroy(seat: *Seat) void {
-    seat.makeInert();
+    seat.opEnd();
+    seat.layer_shell.makeInert();
+    seat.xkb_bindings_seat.makeInert();
+    while (seat.xkb_bindings.first()) |binding| binding.destroy();
+    while (seat.pointer_bindings.first()) |binding| binding.destroy();
 
     while (seat.event_queue.popFront()) |event| {
         switch (event) {
@@ -404,240 +405,9 @@ pub fn manageStart(seat: *Seat) void {
     seat.layer_shell.manageStart();
     seat.xkb_bindings_seat.manageStart();
 
-    if (server.wm.object) |wm_v1| {
-        const new = seat.object == null;
-        const seat_v1 = seat.object orelse blk: {
-            assert(seat.op == null);
-            assert(seat.layer_shell.object == null);
-            assert(seat.xkb_bindings_seat.object == null);
-            assert(seat.xkb_bindings.empty());
-            assert(seat.pointer_bindings.empty());
-
-            const seat_v1 = river.SeatV1.create(wm_v1.getClient(), wm_v1.getVersion(), 0) catch {
-                log.err("out of memory", .{});
-                return; // try again next update
-            };
-            seat.object = seat_v1;
-
-            seat_v1.setHandler(*Seat, handleRequest, handleDestroy, seat);
-            wm_v1.sendSeat(seat_v1);
-
-            seat.link_sent.remove();
-            server.wm.sent.seats.append(seat);
-
-            break :blk seat_v1;
-        };
-        errdefer comptime unreachable;
-
-        if (new) {
-            seat_v1.sendWlSeat(seat.wlr_seat.global.getName(seat_v1.getClient()));
-        }
-
-        if (new) {
-            if (seat.wm_scheduled.hovered) |ref| {
-                if (ref.get()) |window| {
-                    if (window.object) |window_v1| {
-                        seat_v1.sendPointerEnter(window_v1);
-                        seat.wm_sent.hovered = seat.wm_scheduled.hovered;
-                    }
-                }
-            }
-        } else if (seat.wm_scheduled.hovered != seat.wm_sent.hovered) {
-            if (seat.wm_sent.hovered != null) {
-                seat_v1.sendPointerLeave();
-                seat.wm_sent.hovered = null;
-            }
-            if (seat.wm_scheduled.hovered) |ref| {
-                if (ref.get()) |window| {
-                    if (window.object) |window_v1| {
-                        seat_v1.sendPointerEnter(window_v1);
-                        seat.wm_sent.hovered = seat.wm_scheduled.hovered;
-                    }
-                }
-            }
-        }
-
-        {
-            const x = math.lossyCast(i32, seat.cursor.wlr_cursor.x);
-            const y = math.lossyCast(i32, seat.cursor.wlr_cursor.y);
-            if (new or x != seat.wm_sent.x or y != seat.wm_sent.y) {
-                if (seat_v1.getVersion() >= 2) {
-                    seat_v1.sendPointerPosition(x, y);
-                }
-                seat.wm_sent.x = x;
-                seat.wm_sent.y = y;
-            }
-        }
-
-        switch (seat.wm_scheduled.interaction) {
-            .none => {},
-            .window => |ref| {
-                if (ref.get()) |window| {
-                    if (window.object) |window_v1| {
-                        seat_v1.sendWindowInteraction(window_v1);
-                    }
-                }
-            },
-            .shell_surface => |shell_surface| {
-                seat_v1.sendShellSurfaceInteraction(shell_surface.object);
-            },
-        }
-
-        if (seat.op) |*op| {
-            seat_v1.sendOpDelta(op.x - op.start_x, op.y - op.start_y);
-
-            if (seat.wm_scheduled.op_release and !op.sent_release) {
-                seat_v1.sendOpRelease();
-                seat.wm_scheduled.op_release = false;
-                op.sent_release = true;
-            }
-        }
-
-        {
-            var it = seat.xkb_bindings.iterator(.forward);
-            while (it.next()) |binding| {
-                switch (binding.wm_scheduled.state_change) {
-                    .none => {},
-                    .pressed => {
-                        assert(!binding.sent_pressed);
-                        binding.sent_pressed = true;
-                        binding.object.sendPressed();
-                    },
-                    .stop_repeat => {
-                        assert(binding.sent_pressed);
-                        if (binding.object.getVersion() >= 2) {
-                            binding.object.sendStopRepeat();
-                        }
-                    },
-                    .released => {
-                        assert(binding.sent_pressed);
-                        binding.sent_pressed = false;
-                        binding.object.sendReleased();
-                    },
-                }
-                binding.wm_scheduled.state_change = .none;
-            }
-        }
-        {
-            var it = seat.pointer_bindings.iterator(.forward);
-            while (it.next()) |binding| {
-                switch (binding.wm_scheduled.state_change) {
-                    .none => {},
-                    .pressed => {
-                        assert(!binding.sent_pressed);
-                        binding.sent_pressed = true;
-                        binding.object.sendPressed();
-                    },
-                    .released => {
-                        assert(binding.sent_pressed);
-                        binding.sent_pressed = false;
-                        binding.object.sendReleased();
-                    },
-                }
-                binding.wm_scheduled.state_change = .none;
-            }
-        }
-    }
     // Ensure we don't store an interaction that happens while no window manager
     // is connected until a new window manager connects.
     seat.wm_scheduled.interaction = .none;
-}
-
-pub fn makeInert(seat: *Seat) void {
-    if (seat.object) |seat_v1| {
-        seat_v1.sendRemoved();
-        seat_v1.setHandler(?*anyopaque, handleRequestInert, null, null);
-        handleDestroy(seat_v1, seat);
-    } else {
-        assert(seat.op == null);
-        assert(seat.layer_shell.object == null);
-        assert(seat.xkb_bindings_seat.object == null);
-        assert(seat.xkb_bindings.empty());
-        assert(seat.pointer_bindings.empty());
-    }
-}
-
-fn handleRequestInert(
-    seat_v1: *river.SeatV1,
-    request: river.SeatV1.Request,
-    _: ?*anyopaque,
-) void {
-    if (request == .destroy) seat_v1.destroy();
-}
-
-fn handleDestroy(_: *river.SeatV1, seat: *Seat) void {
-    seat.object = null;
-    seat.opEnd();
-
-    seat.layer_shell.makeInert();
-    seat.xkb_bindings_seat.makeInert();
-
-    while (seat.xkb_bindings.first()) |binding| binding.destroy();
-    while (seat.pointer_bindings.first()) |binding| binding.destroy();
-
-    seat.object = null;
-}
-
-fn handleRequest(
-    seat_v1: *river.SeatV1,
-    request: river.SeatV1.Request,
-    seat: *Seat,
-) void {
-    assert(seat.object == seat_v1);
-    switch (request) {
-        .destroy => {
-            seat_v1.destroy();
-        },
-        .focus_window => |args| {
-            if (!server.wm.ensureWindowing()) return;
-            const data = args.window.getUserData() orelse return;
-            const window: *Window = @ptrCast(@alignCast(data));
-            seat.wm_requested.focus = .{ .window = window.ref };
-        },
-        .focus_shell_surface => |args| {
-            if (!server.wm.ensureWindowing()) return;
-            const data = args.shell_surface.getUserData() orelse return;
-            const shell_surface: *ShellSurface = @ptrCast(@alignCast(data));
-            seat.wm_requested.focus = .{ .shell_surface = shell_surface };
-        },
-        .clear_focus => seat.wm_requested.focus = .clear,
-
-        .op_start_pointer => {
-            if (!server.wm.ensureWindowing()) return;
-            seat.wm_requested.op = .start_pointer;
-        },
-        .op_end => {
-            if (!server.wm.ensureWindowing()) return;
-            seat.wm_requested.op = .end;
-        },
-        .get_pointer_binding => |args| {
-            PointerBinding.create(
-                seat,
-                seat_v1.getClient(),
-                seat_v1.getVersion(),
-                args.id,
-                args.button,
-                args.modifiers,
-            ) catch {
-                seat_v1.getClient().postNoMemory();
-                log.err("out of memory", .{});
-                return;
-            };
-        },
-        .set_xcursor_theme => |args| {
-            seat.cursor.setTheme(args.name, args.size) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    seat_v1.getClient().postNoMemory();
-                    log.err("out of memory", .{});
-                    return;
-                },
-            };
-        },
-        .pointer_warp => |args| {
-            if (!server.wm.ensureWindowing()) return;
-            seat.wm_requested.pointer_warp = .{ .x = args.x, .y = args.y };
-        },
-    }
 }
 
 pub fn manageFinish(seat: *Seat) void {

@@ -6,20 +6,12 @@ const LayerShellOutput = @This();
 const std = @import("std");
 const assert = std.debug.assert;
 const wlr = @import("wlroots");
-const wayland = @import("wayland");
-const wl = wayland.server.wl;
-const river = wayland.server.river;
-const zwlr = wayland.server.zwlr;
+const zwlr = @import("wayland").server.zwlr;
 
 const server = &@import("main.zig").server;
-const util = @import("util.zig");
 
 const Output = @import("Output.zig");
 const SceneNodeData = @import("SceneNodeData.zig");
-
-const log = std.log.scoped(.wm);
-
-object: ?*river.LayerShellOutputV1 = null,
 
 scheduled: struct {
     non_exclusive_area: wlr.Box = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
@@ -31,63 +23,10 @@ requested: struct {
     default: bool = false,
 } = .{},
 
-pub fn createObject(
-    shell_output: *LayerShellOutput,
-    client: *wl.Client,
-    version: u32,
-    id: u32,
-) void {
-    assert(shell_output.object == null);
-    shell_output.object = river.LayerShellOutputV1.create(client, version, id) catch {
-        client.postNoMemory();
-        log.err("out of memory", .{});
-        return;
-    };
-    shell_output.object.?.setHandler(*LayerShellOutput, handleRequest, handleDestroy, shell_output);
-    server.wm.dirtyWindowing();
-}
-
-pub fn makeInert(shell_output: *LayerShellOutput) void {
-    if (shell_output.object) |object| {
-        object.setHandler(?*anyopaque, handleRequestInert, null, null);
-        handleDestroy(object, shell_output);
-    }
-}
-
-fn handleRequestInert(
-    object: *river.LayerShellOutputV1,
-    request: river.LayerShellOutputV1.Request,
-    _: ?*anyopaque,
-) void {
-    if (request == .destroy) object.destroy();
-}
-
-fn handleDestroy(_: *river.LayerShellOutputV1, shell_output: *LayerShellOutput) void {
-    shell_output.object = null;
-    shell_output.sent = .{};
-    shell_output.requested = .{};
-}
-
-fn handleRequest(
-    layer_shell_output_v1: *river.LayerShellOutputV1,
-    request: river.LayerShellOutputV1.Request,
-    shell_output: *LayerShellOutput,
-) void {
-    assert(shell_output.object == layer_shell_output_v1);
-    switch (request) {
-        .destroy => layer_shell_output_v1.destroy(),
-        .set_default => {
-            var it = server.om.outputs.iterator(.forward);
-            while (it.next()) |output| {
-                output.layer_shell.requested.default = false;
-            }
-            shell_output.requested.default = true;
-        },
-    }
-}
+pub fn makeInert(_: *LayerShellOutput) void {}
 
 pub fn arrange(shell_output: *LayerShellOutput) void {
-    const output: *Output = @fieldParentPtr("layer_shell", shell_output);
+    const output: *Output = @alignCast(@fieldParentPtr("layer_shell", shell_output));
     shell_output.scheduled.non_exclusive_area = output.scheduled.box();
     sendConfigures(output, .exclusive);
     sendConfigures(output, .non_exclusive);
@@ -152,7 +91,7 @@ fn sendConfigures(
 }
 
 pub fn manageStart(shell_output: *LayerShellOutput) void {
-    const output: *Output = @fieldParentPtr("layer_shell", shell_output);
+    const output: *Output = @alignCast(@fieldParentPtr("layer_shell", shell_output));
     assert(output.scheduled.state == .enabled or output.scheduled.state == .disabled_soft);
 
     const scheduled_box = output.scheduled.box();
@@ -167,14 +106,6 @@ pub fn manageStart(shell_output: *LayerShellOutput) void {
         shell_output.sent.non_exclusive_area,
         shell_output.scheduled.non_exclusive_area,
     )) {
-        if (shell_output.object) |layer_shell_output_v1| {
-            layer_shell_output_v1.sendNonExclusiveArea(
-                shell_output.scheduled.non_exclusive_area.x,
-                shell_output.scheduled.non_exclusive_area.y,
-                shell_output.scheduled.non_exclusive_area.width,
-                shell_output.scheduled.non_exclusive_area.height,
-            );
-            shell_output.sent.non_exclusive_area = shell_output.scheduled.non_exclusive_area;
-        }
+        shell_output.sent.non_exclusive_area = shell_output.scheduled.non_exclusive_area;
     }
 }

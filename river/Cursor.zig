@@ -311,22 +311,8 @@ fn handleRequestSetCursor(
             cursor.setImage(.none);
         }
     }
-    // Except for the window manager client
-    if (server.wm.object) |object| {
-        if (event.seat_client.client == object.getClient() and
-            object.getVersion() >= 4)
-        {
-            if (event.surface) |surface| {
-                cursor.setWmImage(.{ .client = .{
-                    .surface = surface,
-                    .hotspot_x = event.hotspot_x,
-                    .hotspot_y = event.hotspot_y,
-                } });
-            } else {
-                cursor.setWmImage(.none);
-            }
-        }
-    }
+    // Nile: no window manager client cursor handling (river protocols removed)
+    _ = event.seat_client;
 }
 
 fn clearFocus(cursor: *Cursor) void {

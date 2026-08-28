@@ -1,14 +1,12 @@
 // SPDX-FileCopyrightText: © 2024 The River Developers
 // SPDX-License-Identifier: GPL-3.0-only
 
+// Nile: river_shell_surface_v1 protocol removed. Keep scene tree logic without protocol objects.
+
 const ShellSurface = @This();
 
-const build_options = @import("build_options");
-const std = @import("std");
-const assert = std.debug.assert;
 const wlr = @import("wlroots");
 const wl = @import("wayland").server.wl;
-const river = @import("wayland").server.river;
 
 const server = &@import("main.zig").server;
 const util = @import("util.zig");
@@ -16,8 +14,6 @@ const util = @import("util.zig");
 const Scene = @import("Scene.zig");
 const SceneNodeData = @import("SceneNodeData.zig");
 const WmNode = @import("WmNode.zig");
-
-const log = std.log.scoped(.wm);
 
 const role: wlr.Surface.Role = .{
     .name = "river_shell_surface_v1",
@@ -27,7 +23,6 @@ const role: wlr.Surface.Role = .{
     .destroy = roleDestroy,
 };
 
-object: *river.ShellSurfaceV1,
 surface: *wlr.Surface,
 tree: *wlr.SceneTree,
 surfaces: Scene.SaveableSurfaces,
@@ -41,20 +36,8 @@ rendering_requested: struct {
 } = .{},
 
 pub fn create(
-    client: *wl.Client,
-    version: u32,
-    id: u32,
     surface: *wlr.Surface,
 ) !void {
-    log.debug("new river_shell_surface_v1", .{});
-
-    const shell_surface_v1 = try river.ShellSurfaceV1.create(client, version, id);
-
-    if (!surface.setRole(&role, @ptrCast(shell_surface_v1), @intFromEnum(river.WindowManagerV1.Error.role))) {
-        return;
-    }
-    surface.setRoleObject(@ptrCast(shell_surface_v1));
-
     const shell_surface = try util.gpa.create(ShellSurface);
     errdefer util.gpa.destroy(shell_surface);
 
@@ -71,17 +54,21 @@ pub fn create(
     try SceneNodeData.attach(&popup_tree.node, .{ .shell_surface = shell_surface });
 
     shell_surface.* = .{
-        .object = shell_surface_v1,
         .surface = surface,
         .tree = tree,
         .surfaces = surfaces,
         .popup_tree = popup_tree,
         .node = undefined,
     };
+    if (!surface.setRole(&role, shell_surface, 0)) {
+        tree.node.destroy();
+        popup_tree.node.destroy();
+        util.gpa.destroy(shell_surface);
+        return;
+    }
+    surface.setRoleObject(shell_surface);
     shell_surface.node.init(.shell_surface);
     server.wm.rendering_requested.list.append(&shell_surface.node);
-
-    shell_surface_v1.setHandler(*ShellSurface, handleRequest, null, shell_surface);
 }
 
 fn roleDestroy(wlr_surface: *wlr.Surface) callconv(.c) void {
@@ -96,32 +83,6 @@ fn roleDestroy(wlr_surface: *wlr.Surface) callconv(.c) void {
     shell_surface.popup_tree.node.destroy();
 
     util.gpa.destroy(shell_surface);
-}
-
-fn handleRequest(
-    shell_surface_v1: *river.ShellSurfaceV1,
-    request: river.ShellSurfaceV1.Request,
-    shell_surface: *ShellSurface,
-) void {
-    assert(shell_surface.object == shell_surface_v1);
-    switch (request) {
-        .destroy => shell_surface_v1.destroy(),
-        .get_node => |args| {
-            if (shell_surface.node.object != null) {
-                shell_surface_v1.postError(.node_exists, "shell surface already has a node object");
-                return;
-            }
-            shell_surface.node.createObject(
-                shell_surface_v1.getClient(),
-                shell_surface_v1.getVersion(),
-                args.id,
-            );
-        },
-        .sync_next_commit => {
-            if (!server.wm.ensureRendering()) return;
-            shell_surface.rendering_requested.sync_next_commit = true;
-        },
-    }
 }
 
 fn fromWlrSurface(wlr_surface: *wlr.Surface) ?*ShellSurface {
@@ -147,11 +108,8 @@ pub fn renderFinish(shell_surface: *ShellSurface) void {
     const rendering_requested = &shell_surface.rendering_requested;
     if (rendering_requested.sync_next_commit) {
         rendering_requested.sync_next_commit = false;
-
         if (!shell_surface.surfaces.saved) {
-            shell_surface.object.postError(.no_commit,
-                \\no wl_surface.commit after sync_next_commit and before update_rendering_finish
-            );
+            // Nile: no protocol object to postError
         }
     }
 

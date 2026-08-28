@@ -9,7 +9,6 @@ const math = std.math;
 const wlr = @import("wlroots");
 const wayland = @import("wayland");
 const wl = wayland.server.wl;
-const river = wayland.server.river;
 const zwlr = wayland.server.zwlr;
 
 const server = &@import("main.zig").server;
@@ -25,11 +24,7 @@ const SlotMap = @import("slotmap").SlotMap;
 
 const log = std.log.scoped(.wm);
 
-global: *wl.Global,
 wlr_shell: *wlr.LayerShellV1,
-
-/// The layer shell object of the active window manager, if any
-objects: wl.list.Head(river.LayerShellV1, null),
 
 surfaces: SlotMap(*LayerSurface) = .empty,
 
@@ -37,11 +32,8 @@ new_surface: wl.Listener(*wlr.LayerSurfaceV1) = .init(handleNewSurface),
 
 pub fn init(layer_shell: *LayerShell) !void {
     layer_shell.* = .{
-        .global = try wl.Global.create(server.wl_server, river.LayerShellV1, 1, *LayerShell, layer_shell, bind),
         .wlr_shell = try wlr.LayerShellV1.create(server.wl_server, 4),
-        .objects = undefined,
     };
-    layer_shell.objects.init();
     layer_shell.wlr_shell.events.new_surface.add(&layer_shell.new_surface);
 }
 
@@ -50,65 +42,11 @@ pub fn init(layer_shell: *LayerShell) !void {
 // for the wl_server to be destroyed and asserts that the new_surface event has
 // no remaining listeners.
 pub fn deinit(layer_shell: *LayerShell) void {
-    layer_shell.global.destroy();
     layer_shell.new_surface.link.remove();
 }
 
-fn bind(client: *wl.Client, layer_shell: *LayerShell, version: u32, id: u32) void {
-    const object = river.LayerShellV1.create(client, version, id) catch {
-        client.postNoMemory();
-        log.err("out of memory", .{});
-        return;
-    };
-    object.setHandler(?*anyopaque, handleRequest, handleDestroy, null);
-    layer_shell.objects.append(object);
-}
-
-fn handleDestroy(object: *river.LayerShellV1, _: ?*anyopaque) void {
-    object.getLink().remove();
-}
-
-fn handleRequest(
-    object: *river.LayerShellV1,
-    request: river.LayerShellV1.Request,
-    _: ?*anyopaque,
-) void {
-    switch (request) {
-        .destroy => object.destroy(),
-        .get_output => |args| {
-            const output_data = args.output.getUserData() orelse return;
-            const output: *Output = @ptrCast(@alignCast(output_data));
-            if (output.layer_shell.object != null) {
-                object.postError(
-                    .object_already_created,
-                    "river_layer_shell_output_v1 already created",
-                );
-                return;
-            }
-            output.layer_shell.createObject(object.getClient(), object.getVersion(), args.id);
-        },
-        .get_seat => |args| {
-            const seat_data = args.seat.getUserData() orelse return;
-            const seat: *Seat = @ptrCast(@alignCast(seat_data));
-            if (seat.layer_shell.object != null) {
-                object.postError(
-                    .object_already_created,
-                    "river_layer_shell_seat_v1 already created",
-                );
-                return;
-            }
-            seat.layer_shell.createObject(object.getClient(), object.getVersion(), args.id);
-        },
-    }
-}
-
-fn supported(layer_shell: *LayerShell) bool {
-    const wm_v1 = server.wm.object orelse return false;
-    var it = layer_shell.objects.iterator(.forward);
-    while (it.next()) |object| {
-        if (object.getClient() == wm_v1.getClient()) return true;
-    }
-    return false;
+fn supported(_: *LayerShell) bool {
+    return true;
 }
 
 fn handleNewSurface(_: *wl.Listener(*wlr.LayerSurfaceV1), wlr_layer_surface: *wlr.LayerSurfaceV1) void {

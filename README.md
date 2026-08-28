@@ -7,18 +7,22 @@ SPDX-License-Identifier: CC-BY-SA-4.0
   <img src="logo/logo_text_adaptive_color.svg" width="600em">
 </div>
 
+> **Nile fork:** This is [Nile](https://github.com/KernelState/nile) — River reimagined as a **function-first compositor**. The six custom River Wayland protocols (`river_window_management_v1`, `river_xkb_bindings_v1`, `river_layer_shell_v1`, `river_input_management_v1`, `river_libinput_config_v1`, `river_xkb_config_v1`) have been **removed**. All window management is now via direct Zig functions in `river/Nile.zig`. See [`doc/nile-api.md`](doc/nile-api.md) for the new API.
+
 ## Overview
 
-River is a non-monolithic Wayland compositor. Unlike other Wayland compositors,
-river does not combine the compositor and window manager into one program.
-Instead, users can choose any window manager implementing the
-[river-window-management-v1] protocol.
+River is a Wayland compositor. **Nile** keeps River's high-performance wlroots core (frame-perfect rendering, Xwayland, layer shell, etc.) but replaces the out-of-process window manager protocol with ordinary functions you call from in-process Zig code.
 
-Read my blog post, [Separating the Wayland Compositor and Window Manager](https://isaacfreund.com/blog/river-window-management/),
-for an in-depth explanation.
+Instead of an external window manager speaking `river-window-management-v1`, you write:
 
-There is a [list of compatible window managers](https://codeberg.org/river/wiki/src/branch/main/pages/wm-list.md)
-on our [wiki](https://codeberg.org/river/wiki).
+```zig
+const Nile = @import("river/Nile.zig");
+Nile.Window.setPosition(win, 100, 100);
+Nile.Seat.focusWindow(Nile.Seat.default(), win);
+Nile.dirtyWindowing();
+```
+
+See [`doc/nile-api.md`](doc/nile-api.md) for the full API and migration guide. For the original River protocol design, read [Separating the Wayland Compositor and Window Manager](https://isaacfreund.com/blog/river-window-management/) (historical).
 
 > *If you are looking for the old dynamic tiling version of river, see
 [river-classic](https://codeberg.org/river/river-classic).*
@@ -33,19 +37,14 @@ on our [wiki](https://codeberg.org/river/wiki).
 - [Issue Tracker](https://codeberg.org/river/river/issues)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 
-## Features
+## Features (Nile)
 
-River defers all window management policy to a separate window manager
-implementing the [river-window-management-v1] protocol. This includes window
-position/size, pointer/keyboard bindings, focus management, window decorations,
-desktop shell graphics, and more.
+- **Function API** (`river/Nile.zig:1`): `Nile.Window`, `Nile.Output`, `Nile.Seat`, `Nile.Input`, `Nile.Layer` — typed, documented functions instead of Wayland globals.
+- Frame perfect rendering, good performance, support for many Wayland protocol extensions, robust Xwayland support.
+- Standard protocols unchanged: `xdg_shell`, `wlr_layer_shell`, `ext_session_lock`, `wlr_output_management`, etc.
+- River's six custom `river_*_v1` protocols and their XML files (`protocol/river-*.xml`) have been deleted. No `river-protocols` pkgconfig is installed.
 
-River itself provides frame perfect rendering, good performance, support for
-many Wayland protocol extensions, robust Xwayland support, the ability to
-hot-swap window managers, and more.
-
-The [river-window-management-v1] protocol and other river protocol extensions
-are stable.  We do not break window managers.
+For River classic protocol design (historical), see [Separating the Wayland Compositor and Window Manager](https://isaacfreund.com/blog/river-window-management/).
 
 ## Motivation
 

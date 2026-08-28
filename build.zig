@@ -87,13 +87,6 @@ pub fn build(b: *Build) !void {
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml");
 
-    scanner.addCustomProtocol(b.path("protocol/river-window-management-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/river-xkb-bindings-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/river-layer-shell-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/river-input-management-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/river-libinput-config-v1.xml"));
-    scanner.addCustomProtocol(b.path("protocol/river-xkb-config-v1.xml"));
-
     scanner.addCustomProtocol(b.path("protocol/upstream/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/upstream/wlr-output-power-management-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/upstream/virtual-keyboard-unstable-v1.xml"));
@@ -122,13 +115,6 @@ pub fn build(b: *Build) !void {
     scanner.generate("wp_tearing_control_manager_v1", 1);
     scanner.generate("wp_color_manager_v1", 2);
     scanner.generate("wp_color_representation_manager_v1", 1);
-
-    scanner.generate("river_window_manager_v1", 5);
-    scanner.generate("river_xkb_bindings_v1", 3);
-    scanner.generate("river_layer_shell_v1", 1);
-    scanner.generate("river_input_manager_v1", 2);
-    scanner.generate("river_libinput_config_v1", 2);
-    scanner.generate("river_xkb_config_v1", 2);
 
     scanner.generate("zwlr_output_power_manager_v1", 1);
     scanner.generate("zwlr_layer_shell_v1", 4);
@@ -202,31 +188,6 @@ pub fn build(b: *Build) !void {
         river.root_module.omit_frame_pointer = omit_frame_pointer;
 
         b.installArtifact(river);
-    }
-
-    {
-        const wf = Build.Step.WriteFile.create(b);
-        const pc_file = wf.add("river-protocols.pc", b.fmt(
-            \\prefix={s}
-            \\datarootdir=${{prefix}}/share
-            \\pkgdatadir=${{pc_sysrootdir}}${{datarootdir}}/river-protocols
-            \\
-            \\Name: river-protocols
-            \\URL: https://isaacfreund.com/software/river
-            \\Description: Protocol files for river, a non-monolithic Wayland compositor
-            \\Version: {s}
-        , .{ b.install_prefix, full_version }));
-        b.getInstallStep().dependOn(&b.addInstallFile(pc_file, "share/pkgconfig/river-protocols.pc").step);
-        inline for (&.{
-            "river-window-management-v1.xml",
-            "river-xkb-bindings-v1.xml",
-            "river-layer-shell-v1.xml",
-            "river-input-management-v1.xml",
-            "river-libinput-config-v1.xml",
-            "river-xkb-config-v1.xml",
-        }) |protocol| {
-            b.installFile("protocol/" ++ protocol, "share/river-protocols/stable/" ++ protocol);
-        }
     }
 
     if (man_pages) {

@@ -11,7 +11,6 @@ const meta = std.meta;
 const posix = std.posix;
 const wlr = @import("wlroots");
 const wl = @import("wayland").server.wl;
-const river = @import("wayland").server.river;
 const SlotMap = @import("slotmap").SlotMap;
 
 const server = &@import("main.zig").server;
@@ -27,6 +26,34 @@ const XdgToplevel = @import("XdgToplevel.zig");
 const XwaylandWindow = @import("XwaylandWindow.zig");
 
 const log = std.log.scoped(.wm);
+
+pub const Edges = packed struct(u32) {
+    top: bool = false,
+    bottom: bool = false,
+    left: bool = false,
+    right: bool = false,
+    _pad: u28 = 0,
+};
+
+pub const Capabilities = packed struct(u32) {
+    window_menu: bool = false,
+    maximize: bool = false,
+    fullscreen: bool = false,
+    minimize: bool = false,
+    _pad: u28 = 0,
+};
+
+pub const DecorationHint = enum {
+    no_preference,
+    only_supports_csd,
+    prefers_ssd,
+    prefers_csd,
+};
+
+pub const PresentationMode = enum {
+    vsync,
+    async,
+};
 
 pub const Dimensions = struct {
     width: u31,
@@ -56,7 +83,7 @@ pub const FullscreenRequest = union(enum) {
 };
 
 pub const Border = struct {
-    edges: river.WindowV1.Edges = .{},
+    edges: Edges = .{},
     width: u31 = 0,
     r: u32 = 0,
     b: u32 = 0,
@@ -69,8 +96,8 @@ const WmRequested = struct {
     dimensions: ?Dimensions,
     bounds: Dimensions,
     ssd: bool,
-    tiled: river.WindowV1.Edges,
-    capabilities: river.WindowV1.Capabilities,
+    tiled: Edges,
+    capabilities: Capabilities,
     resizing: bool,
     maximized: bool,
     fullscreen: ?*Output,
@@ -103,8 +130,8 @@ pub const Configure = struct {
     /// True if the window has keyboard focus from at least one seat.
     activated: bool,
     ssd: bool,
-    tiled: river.WindowV1.Edges,
-    capabilities: river.WindowV1.Capabilities,
+    tiled: Edges,
+    capabilities: Capabilities,
     maximized: bool,
     inform_fullscreen: bool,
     resizing: bool,
@@ -152,10 +179,6 @@ pub const Ref = packed struct {
 
 ref: Ref,
 
-/// The window management protocol object for this window
-/// Created in manageStart() when state is .ready
-/// Set to null in manageStart() when state is .closing
-object: ?*river.WindowV1 = null,
 node: WmNode,
 
 state: enum {
@@ -204,38 +227,38 @@ popup_tree: *wlr.SceneTree,
 capture_scene: *wlr.Scene,
 capture_source: ?*wlr.ExtImageCaptureSourceV1 = null,
 
-/// State to be sent to the wm in the next manage sequence.
-wm_scheduled: struct {
-    dimensions_hint: DimensionsHint = .{},
-    decoration_hint: river.WindowV1.DecorationHint = .only_supports_csd,
-    show_window_menu_requested: ?struct { x: i32, y: i32 } = null,
-    /// Set back to no_request at the end of each update sequence
-    fullscreen_requested: FullscreenRequest = .no_request,
-    maximize_requested: enum {
-        no_request,
-        maximize,
-        unmaximize,
-    } = .no_request,
-    minimize_requested: bool = false,
-    dirty_app_id: bool = false,
-    dirty_title: bool = false,
-    pointer_move_requested: ?*Seat = null,
-    pointer_resize_requested: ?struct {
-        seat: *Seat,
-        edges: river.WindowV1.Edges,
-    } = null,
-    capture_session_count: u32 = 0,
-} = .{},
+    /// State to be sent to the wm in the next manage sequence.
+    wm_scheduled: struct {
+        dimensions_hint: DimensionsHint = .{},
+        decoration_hint: DecorationHint = .only_supports_csd,
+        show_window_menu_requested: ?struct { x: i32, y: i32 } = null,
+        /// Set back to no_request at the end of each update sequence
+        fullscreen_requested: FullscreenRequest = .no_request,
+        maximize_requested: enum {
+            no_request,
+            maximize,
+            unmaximize,
+        } = .no_request,
+        minimize_requested: bool = false,
+        dirty_app_id: bool = false,
+        dirty_title: bool = false,
+        pointer_move_requested: ?*Seat = null,
+        pointer_resize_requested: ?struct {
+            seat: *Seat,
+            edges: Edges,
+        } = null,
+        capture_session_count: u32 = 0,
+    } = .{},
 
-/// State sent to the wm in the latest manage sequence.
-/// This state is only kept around in order to avoid sending redundant events
-/// to the wm.
-wm_sent: struct {
-    dimensions_hint: DimensionsHint = .{},
-    decoration_hint: river.WindowV1.DecorationHint = .only_supports_csd,
-    parent: ?Window.Ref = null,
-    capture_session_count: u32 = 0,
-} = .{},
+    /// State sent to the wm in the latest manage sequence.
+    /// This state is only kept around in order to avoid sending redundant events
+    /// to the wm.
+    wm_sent: struct {
+        dimensions_hint: DimensionsHint = .{},
+        decoration_hint: DecorationHint = .only_supports_csd,
+        parent: ?Window.Ref = null,
+        capture_session_count: u32 = 0,
+    } = .{},
 
 /// Windowing state requested by the wm.
 wm_requested: WmRequested = .init,
@@ -254,12 +277,12 @@ rendering_scheduled: struct {
     resend_dimensions: bool = false,
 } = .{},
 
-/// State sent to the wm in the latest render sequence.
-rendering_sent: struct {
-    width: u31 = 0,
-    height: u31 = 0,
-    presentation_hint: river.OutputV1.PresentationMode = .vsync,
-} = .{},
+    /// State sent to the wm in the latest render sequence.
+    rendering_sent: struct {
+        width: u31 = 0,
+        height: u31 = 0,
+        presentation_hint: PresentationMode = .vsync,
+    } = .{},
 
 /// Rendering state requested by the wm.
 rendering_requested: RenderingRequested = .init,
@@ -338,7 +361,6 @@ pub fn destroy(window: *Window) void {
         },
         .ready, .initialized, .mapped => unreachable,
     }
-    assert(window.object == null);
 
     {
         var it = server.input_manager.seats.iterator(.forward);
@@ -382,7 +404,7 @@ pub fn setDimensions(window: *Window, width: u31, height: u31) void {
     }
 }
 
-pub fn setDecorationHint(window: *Window, hint: river.WindowV1.DecorationHint) void {
+pub fn setDecorationHint(window: *Window, hint: DecorationHint) void {
     window.wm_scheduled.decoration_hint = hint;
     if (hint != window.wm_sent.decoration_hint) {
         server.wm.dirtyWindowing();
@@ -406,167 +428,76 @@ pub fn manageStart(window: *Window) void {
             window.makeInert();
         },
         .ready, .initialized, .mapped => {
-            const wm_v1 = server.wm.object orelse return;
-            const new = window.object == null;
-            const window_v1 = window.object orelse blk: {
-                const window_v1 = river.WindowV1.create(wm_v1.getClient(), wm_v1.getVersion(), 0) catch {
-                    log.err("out of memory", .{});
-                    return; // try again next update
-                };
-                window.object = window_v1;
-                window_v1.setHandler(*Window, handleRequest, handleDestroy, window);
-                wm_v1.sendWindow(window_v1);
-
+            // Ensure window is in rendering order list (Nile path, no river_window_v1)
+            var in_list = false;
+            var it = server.wm.rendering_requested.list.iterator(.forward);
+            while (it.next()) |n| if (n == &window.node) {
+                in_list = true;
+                break;
+            };
+            if (!in_list) {
                 window.node.link.remove();
                 server.wm.rendering_requested.list.append(&window.node);
+            }
 
-                // A handle may have already been created if the window manager is restarted.
-                if (window.foreign_toplevel_handle == null) {
-                    if (wlr.ExtForeignToplevelHandleV1.create(server.foreign_toplevel_list, &.{
-                        .title = window.getTitle(),
-                        .app_id = window.getAppId(),
-                    })) |handle| {
-                        window.foreign_toplevel_handle = handle;
-                        handle.data = window;
-                    } else |_| {
-                        log.err("failed to create ext foreign toplevel handle", .{});
-                    }
+            // Foreign toplevel handles (ext and wlr) - not river protocol
+            if (window.foreign_toplevel_handle == null) {
+                if (wlr.ExtForeignToplevelHandleV1.create(server.foreign_toplevel_list, &.{
+                    .title = window.getTitle(),
+                    .app_id = window.getAppId(),
+                })) |handle| {
+                    window.foreign_toplevel_handle = handle;
+                    handle.data = window;
+                } else |_| {
+                    log.err("failed to create ext foreign toplevel handle", .{});
                 }
+            }
 
-                if (window.wlr_toplevel_handle == null) {
-                    if (wlr.ForeignToplevelHandleV1.create(server.wlr_foreign_toplevel_manager)) |handle| {
-                        window.wlr_toplevel_handle = handle;
-                        if (window.getTitle()) |title| handle.setTitle(title);
-                        if (window.getAppId()) |app_id| handle.setAppId(app_id);
-                    } else |_| {
-                        log.err("failed to create wlr foreign toplevel handle", .{});
-                    }
-                }
-
-                break :blk window_v1;
-            };
-
-            errdefer comptime unreachable;
-
-            if (new) {
-                if (window_v1.getVersion() >= 2) {
-                    window_v1.sendUnreliablePid(window.unreliablePid());
-                }
-                if (window_v1.getVersion() >= 4) {
-                    if (window.foreign_toplevel_handle) |handle| {
-                        window_v1.sendIdentifier(handle.identifier);
-                    }
+            if (window.wlr_toplevel_handle == null) {
+                if (wlr.ForeignToplevelHandleV1.create(server.wlr_foreign_toplevel_manager)) |handle| {
+                    window.wlr_toplevel_handle = handle;
+                    if (window.getTitle()) |title| handle.setTitle(title);
+                    if (window.getAppId()) |app_id| handle.setAppId(app_id);
+                } else |_| {
+                    log.err("failed to create wlr foreign toplevel handle", .{});
                 }
             }
 
             const scheduled = &window.wm_scheduled;
             const sent = &window.wm_sent;
 
-            if (new or !meta.eql(scheduled.dimensions_hint, sent.dimensions_hint)) {
-                window_v1.sendDimensionsHint(
-                    scheduled.dimensions_hint.min_width,
-                    scheduled.dimensions_hint.min_height,
-                    scheduled.dimensions_hint.max_width,
-                    scheduled.dimensions_hint.max_height,
-                );
+            if (!meta.eql(scheduled.dimensions_hint, sent.dimensions_hint)) {
                 sent.dimensions_hint = scheduled.dimensions_hint;
             }
-            if (new or scheduled.decoration_hint != sent.decoration_hint) {
-                window_v1.sendDecorationHint(window.wm_scheduled.decoration_hint);
+            if (scheduled.decoration_hint != sent.decoration_hint) {
                 sent.decoration_hint = scheduled.decoration_hint;
             }
 
-            if (scheduled.show_window_menu_requested) |offset| {
-                window_v1.sendShowWindowMenuRequested(offset.x, offset.y);
-                scheduled.show_window_menu_requested = null;
-            }
-            switch (scheduled.fullscreen_requested) {
-                .no_request => {},
-                .fullscreen => |output_hint| {
-                    if (output_hint) |output| {
-                        window_v1.sendFullscreenRequested(output.object);
-                    } else {
-                        window_v1.sendFullscreenRequested(null);
-                    }
-                },
-                .exit => window_v1.sendExitFullscreenRequested(),
-            }
+            scheduled.show_window_menu_requested = null;
             scheduled.fullscreen_requested = .no_request;
-            switch (scheduled.maximize_requested) {
-                .no_request => {},
-                .maximize => window_v1.sendMaximizeRequested(),
-                .unmaximize => window_v1.sendUnmaximizeRequested(),
-            }
             scheduled.maximize_requested = .no_request;
-            if (scheduled.minimize_requested) {
-                window_v1.sendMinimizeRequested();
-            }
             scheduled.minimize_requested = false;
 
             if (window.getParent()) |parent| {
                 if (sent.parent == null or sent.parent.?.get() != parent) {
-                    window_v1.sendParent(parent.object);
                     sent.parent = parent.ref;
                 }
             } else if (sent.parent != null) {
-                window_v1.sendParent(null);
                 sent.parent = null;
             }
 
-            if (new or scheduled.dirty_app_id) {
-                window_v1.sendAppId(window.getAppId());
-                scheduled.dirty_app_id = false;
-            }
-            if (new or scheduled.dirty_title) {
-                window_v1.sendTitle(window.getTitle());
-                scheduled.dirty_title = false;
-            }
+            if (scheduled.dirty_app_id) scheduled.dirty_app_id = false;
+            if (scheduled.dirty_title) scheduled.dirty_title = false;
 
-            if (scheduled.pointer_move_requested) |seat| {
-                if (seat.object) |seat_v1| {
-                    log.debug("send pointer move requested", .{});
-                    window_v1.sendPointerMoveRequested(seat_v1);
-                }
-            }
             scheduled.pointer_move_requested = null;
-            if (scheduled.pointer_resize_requested) |data| {
-                if (data.seat.object) |seat_v1| {
-                    log.debug("send pointer resize requested", .{});
-                    window_v1.sendPointerResizeRequested(seat_v1, data.edges);
-                }
-            }
             scheduled.pointer_resize_requested = null;
 
-            if (new or scheduled.capture_session_count != sent.capture_session_count) {
-                if (window_v1.getVersion() >= 5) {
-                    window_v1.sendCaptureSessions(scheduled.capture_session_count);
-                }
-                sent.capture_session_count = scheduled.capture_session_count;
-            }
+            sent.capture_session_count = scheduled.capture_session_count;
         },
     }
 }
 
 pub fn makeInert(window: *Window) void {
-    if (window.object) |window_v1| {
-        window_v1.sendClosed();
-        window_v1.setHandler(?*anyopaque, handleRequestInert, null, null);
-        handleDestroy(window_v1, window);
-    } else {
-        assert(window.node.object == null);
-    }
-}
-
-fn handleRequestInert(
-    window_v1: *river.WindowV1,
-    request: river.WindowV1.Request,
-    _: ?*anyopaque,
-) void {
-    if (request == .destroy) window_v1.destroy();
-}
-
-fn handleDestroy(_: *river.WindowV1, window: *Window) void {
-    window.object = null;
     window.wm_requested = .init;
     window.rendering_requested = .{
         .x = window.rendering_requested.x,
@@ -584,173 +515,7 @@ fn handleDestroy(_: *river.WindowV1, window: *Window) void {
     }
 }
 
-fn handleRequest(
-    window_v1: *river.WindowV1,
-    request: river.WindowV1.Request,
-    window: *Window,
-) void {
-    assert(window.object == window_v1);
-    const wm_requested = &window.wm_requested;
-    const rendering_requested = &window.rendering_requested;
-    switch (request) {
-        .destroy => window_v1.destroy(),
-        .close => {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.close = true;
-        },
-        .get_node => |args| {
-            if (window.node.object != null) {
-                window_v1.postError(.node_exists, "window already has a node object");
-                return;
-            }
-            window.node.createObject(window_v1.getClient(), window_v1.getVersion(), args.id);
-        },
-        .propose_dimensions => |args| {
-            if (!server.wm.ensureWindowing()) return;
-            if (args.width < 0 or args.height < 0) {
-                window_v1.postError(.invalid_dimensions, "dimensions must be greater than or equal to 0 ");
-                return;
-            }
-            wm_requested.dimensions = .{
-                .width = @intCast(args.width),
-                .height = @intCast(args.height),
-            };
-        },
-        .hide => {
-            if (!server.wm.ensureRendering()) return;
-            rendering_requested.hidden = true;
-        },
-        .show => {
-            if (!server.wm.ensureRendering()) return;
-            rendering_requested.hidden = false;
-        },
-        .use_ssd => {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.ssd = true;
-        },
-        .use_csd => {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.ssd = false;
-        },
-        .set_borders => |args| {
-            if (!server.wm.ensureRendering()) return;
-            if (args.width < 0) {
-                window_v1.postError(.invalid_border, "border width must be greater than or equal to 0 ");
-                return;
-            }
-            rendering_requested.border = .{
-                .edges = args.edges,
-                .width = @intCast(args.width),
-                .r = args.r,
-                .g = args.g,
-                .b = args.b,
-                .a = args.a,
-            };
-        },
-        .set_tiled => |args| {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.tiled = args.edges;
-        },
-        inline .get_decoration_above, .get_decoration_below => |args, req| {
-            const above = req == .get_decoration_above;
-            const surface = wlr.Surface.fromWlSurface(args.surface);
-            const decoration = Decoration.create(
-                window_v1.getClient(),
-                window_v1.getVersion(),
-                args.id,
-                surface,
-                if (above) window.decorations_above_tree else window.decorations_below_tree,
-            ) catch |err| switch (err) {
-                error.OutOfMemory, error.ResourceCreateFailed => {
-                    window_v1.getClient().postNoMemory();
-                    log.err("out of memory", .{});
-                    return;
-                },
-                error.AlreadyHasRole => return,
-            };
-            if (above) {
-                window.decorations_above.append(decoration);
-            } else {
-                window.decorations_below.append(decoration);
-            }
-        },
-        .inform_resize_start => {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.resizing = true;
-        },
-        .inform_resize_end => {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.resizing = false;
-        },
-        .set_capabilities => |args| {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.capabilities = args.caps;
-        },
-        .inform_maximized => {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.maximized = true;
-        },
-        .inform_unmaximized => {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.maximized = false;
-        },
-        .inform_fullscreen => {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.inform_fullscreen = true;
-        },
-        .inform_not_fullscreen => {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.inform_fullscreen = false;
-        },
-        .fullscreen => |args| {
-            if (!server.wm.ensureWindowing()) return;
-            const data = args.output.getUserData() orelse return;
-            const output: *Output = @ptrCast(@alignCast(data));
-            wm_requested.fullscreen = output;
-        },
-        .exit_fullscreen => {
-            if (!server.wm.ensureWindowing()) return;
-            wm_requested.fullscreen = null;
-        },
-        .set_clip_box => |args| {
-            if (!server.wm.ensureRendering()) return;
-            if (args.width < 0 or args.height < 0) {
-                window_v1.postError(.invalid_clip_box, "width/height must be greater than or equal to 0 ");
-                return;
-            }
-            rendering_requested.clip = .{
-                .x = args.x,
-                .y = args.y,
-                .width = args.width,
-                .height = args.height,
-            };
-        },
-        .set_content_clip_box => |args| {
-            if (!server.wm.ensureRendering()) return;
-            if (args.width < 0 or args.height < 0) {
-                window_v1.postError(.invalid_clip_box, "width/height must be greater than or equal to 0 ");
-                return;
-            }
-            rendering_requested.content_clip = .{
-                .x = args.x,
-                .y = args.y,
-                .width = args.width,
-                .height = args.height,
-            };
-        },
-        .set_dimension_bounds => |args| {
-            if (!server.wm.ensureWindowing()) return;
-            if (args.max_width < 0 or args.max_height < 0) {
-                window_v1.postError(.invalid_dimensions, "dimensions must be greater than or equal to 0 ");
-                return;
-            }
-            wm_requested.bounds = .{
-                .width = @intCast(args.max_width),
-                .height = @intCast(args.max_height),
-            };
-        },
-    }
-}
+
 
 /// Applies window management state from the window manager and sends a configure
 /// to the window if necessary.
@@ -896,26 +661,18 @@ pub fn renderStart(window: *Window) void {
         (scheduled.resend_dimensions or
             scheduled.width != sent.width or scheduled.height != sent.height))
     {
-        if (window.object) |window_v1| {
-            window_v1.sendDimensions(scheduled.width, scheduled.height);
-            window.rendering_scheduled.resend_dimensions = false;
-        }
+        window.rendering_scheduled.resend_dimensions = false;
     }
     sent.width = scheduled.width;
     sent.height = scheduled.height;
 
     const presentation_hint = window.presentationHint();
     if (sent.presentation_hint != presentation_hint) {
-        if (window.object) |window_v1| {
-            if (window_v1.getVersion() >= 4) {
-                window_v1.sendPresentationHint(presentation_hint);
-            }
-        }
         sent.presentation_hint = presentation_hint;
     }
 }
 
-fn presentationHint(window: *Window) river.OutputV1.PresentationMode {
+fn presentationHint(window: *Window) PresentationMode {
     const root_surface = window.rootSurface() orelse return .vsync;
     return switch (server.tearing_control_manager.hintFromSurface(root_surface)) {
         .async => .async,

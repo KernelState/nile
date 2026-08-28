@@ -370,10 +370,7 @@ fn allowlist(server: *Server, global: *const wl.Global) bool {
 /// Returns true if the global is blocked for security contexts
 fn blocklist(server: *Server, global: *const wl.Global) bool {
     return global == server.security_context_manager.global or
-        global == server.wm.global or
-        global == server.layer_shell.global or
         global == server.layer_shell.wlr_shell.global or
-        global == server.xkb_bindings.global or
         global == server.screencopy_manager.global or
         global == server.image_copy_capture_manager.global or
         global == server.output_image_capture_source_manager.global or
@@ -386,9 +383,6 @@ fn blocklist(server: *Server, global: *const wl.Global) bool {
         global == server.om.wlr_output_manager.global or
         global == server.om.power_manager.global or
         global == server.om.gamma_control_manager.global or
-        global == server.libinput_config.global or
-        global == server.xkb_config.global or
-        global == server.input_manager.global or
         global == server.input_manager.idle_notifier.global or
         global == server.input_manager.virtual_pointer_manager.global or
         global == server.input_manager.virtual_keyboard_manager.global or
@@ -514,7 +508,7 @@ fn handleRequestSetCursorShape(
     listener: *wl.Listener(*wlr.CursorShapeManagerV1.event.RequestSetShape),
     event: *wlr.CursorShapeManagerV1.event.RequestSetShape,
 ) void {
-    const server: *Server = @fieldParentPtr("request_set_cursor_shape", listener);
+    _ = listener;
     const seat: *Seat = @ptrCast(@alignCast(event.seat_client.seat.data));
 
     const name = wlr.CursorShapeManagerV1.shapeName(event.shape);
@@ -533,14 +527,6 @@ fn handleRequestSetCursorShape(
         const focused_client = event.seat_client.seat.pointer_state.focused_client;
         if (event.seat_client == focused_client) {
             seat.cursor.setImage(.{ .xcursor = name });
-        }
-        // Except for the window manager client
-        if (server.wm.object) |object| {
-            if (event.seat_client.client == object.getClient() and
-                object.getVersion() >= 4)
-            {
-                seat.cursor.setWmImage(.{ .xcursor = name });
-            }
         }
     }
 }

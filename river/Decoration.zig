@@ -1,21 +1,16 @@
 // SPDX-FileCopyrightText: © 2025 The River Developers
 // SPDX-License-Identifier: GPL-3.0-only
 
+// Nile: river_decoration_v1 protocol removed. Keep scene tree logic without protocol objects.
+
 const Decoration = @This();
 
-const build_options = @import("build_options");
-const std = @import("std");
-const assert = std.debug.assert;
 const wlr = @import("wlroots");
 const wl = @import("wayland").server.wl;
-const river = @import("wayland").server.river;
 
-const server = &@import("main.zig").server;
 const util = @import("util.zig");
 
 const Scene = @import("Scene.zig");
-
-const log = std.log.scoped(.wm);
 
 const role: wlr.Surface.Role = .{
     .name = "river_decoration_v1",
@@ -25,7 +20,6 @@ const role: wlr.Surface.Role = .{
     .destroy = null,
 };
 
-object: ?*river.DecorationV1,
 surface: *wlr.Surface,
 tree: *wlr.SceneTree,
 surfaces: Scene.SaveableSurfaces,
@@ -39,19 +33,9 @@ rendering_requested: struct {
 } = .{},
 
 pub fn create(
-    client: *wl.Client,
-    version: u32,
-    id: u32,
     surface: *wlr.Surface,
     parent: *wlr.SceneTree,
 ) !*Decoration {
-    const decoration_v1 = try river.DecorationV1.create(client, version, id);
-
-    if (!surface.setRole(&role, @ptrCast(decoration_v1), @intFromEnum(river.WindowManagerV1.Error.role))) {
-        return error.AlreadyHasRole;
-    }
-    surface.setRoleObject(@ptrCast(decoration_v1));
-
     const decoration = try util.gpa.create(Decoration);
     errdefer util.gpa.destroy(decoration);
 
@@ -62,64 +46,30 @@ pub fn create(
     _ = try surfaces.tree.createSceneSubsurfaceTree(surface);
 
     decoration.* = .{
-        .object = decoration_v1,
         .surface = surface,
         .tree = tree,
         .surfaces = surfaces,
         .link = undefined,
     };
 
-    decoration_v1.setHandler(*Decoration, handleRequest, handleDestroy, decoration);
+    if (!surface.setRole(&role, decoration, 0)) {
+        tree.node.destroy();
+        util.gpa.destroy(decoration);
+        return error.AlreadyHasRole;
+    }
+    surface.setRoleObject(decoration);
 
     return decoration;
 }
 
 pub fn destroy(decoration: *Decoration) void {
-    assert(decoration.object == null);
     decoration.tree.node.destroy();
     decoration.link.remove();
     util.gpa.destroy(decoration);
 }
 
 pub fn makeInert(decoration: *Decoration) void {
-    if (decoration.object) |object| {
-        object.setHandler(?*anyopaque, handleRequestInert, null, null);
-        decoration.object = null;
-    }
     decoration.surfaces.save();
-}
-
-fn handleRequestInert(
-    node_v1: *river.DecorationV1,
-    request: river.DecorationV1.Request,
-    _: ?*anyopaque,
-) void {
-    if (request == .destroy) node_v1.destroy();
-}
-
-fn handleDestroy(_: *river.DecorationV1, decoration: *Decoration) void {
-    decoration.object = null;
-    decoration.destroy();
-}
-
-fn handleRequest(
-    decoration_v1: *river.DecorationV1,
-    request: river.DecorationV1.Request,
-    decoration: *Decoration,
-) void {
-    assert(decoration.object == decoration_v1);
-    switch (request) {
-        .destroy => decoration_v1.destroy(),
-        .set_offset => |args| {
-            if (!server.wm.ensureRendering()) return;
-            decoration.rendering_requested.offset_x = args.x;
-            decoration.rendering_requested.offset_y = args.y;
-        },
-        .sync_next_commit => {
-            if (!server.wm.ensureRendering()) return;
-            decoration.rendering_requested.sync_next_commit = true;
-        },
-    }
 }
 
 fn clientCommit(wlr_surface: *wlr.Surface) callconv(.c) void {
@@ -141,13 +91,8 @@ pub fn renderFinish(decoration: *Decoration, window_clip: *const wlr.Box) void {
     const rendering_requested = &decoration.rendering_requested;
     if (rendering_requested.sync_next_commit) {
         rendering_requested.sync_next_commit = false;
-
         if (!decoration.surfaces.saved) {
-            if (decoration.object) |object| {
-                object.postError(.no_commit,
-                    \\no wl_surface.commit after sync_next_commit and before update_rendering_finish
-                );
-            }
+            // Nile: no protocol object to postError; just proceed
         }
     }
 
@@ -155,7 +100,6 @@ pub fn renderFinish(decoration: *Decoration, window_clip: *const wlr.Box) void {
 
     decoration.tree.node.setPosition(rendering_requested.offset_x, rendering_requested.offset_y);
 
-    // wlroots asserts that a subsurface tree is present.
     if (!decoration.surfaces.tree.children.empty()) {
         var clip = window_clip.*;
         clip.x -= rendering_requested.offset_x;

@@ -9,7 +9,6 @@ const assert = std.debug.assert;
 const mem = std.mem;
 const wlr = @import("wlroots");
 const wl = @import("wayland").server.wl;
-const river = @import("wayland").server.river;
 
 const server = &@import("main.zig").server;
 const util = @import("util.zig");
@@ -25,8 +24,7 @@ const default_seat_name = "default";
 
 const log = std.log.scoped(.input);
 
-global: *wl.Global,
-objects: wl.list.Head(river.InputManagerV1, null),
+global: ?*wl.Global = null,
 
 new_input: wl.Listener(*wlr.InputDevice) = .init(handleNewInput),
 
@@ -51,7 +49,7 @@ new_text_input: wl.Listener(*wlr.TextInputV3) = .init(handleNewTextInput),
 
 pub fn init(input_manager: *InputManager) !void {
     input_manager.* = .{
-        .global = try wl.Global.create(server.wl_server, river.InputManagerV1, 2, *InputManager, input_manager, bind),
+        .global = null, // Nile: legacy river_input_manager_v1 disabled, see Nile.zig
         // These are automatically freed when the display is destroyed
         .idle_notifier = try wlr.IdleNotifierV1.create(server.wl_server),
         .relative_pointer_manager = try wlr.RelativePointerManagerV1.create(server.wl_server),
@@ -63,11 +61,9 @@ pub fn init(input_manager: *InputManager) !void {
         .text_input_manager = try wlr.TextInputManagerV3.create(server.wl_server),
         .tablet_manager = try wlr.TabletManagerV2.create(server.wl_server),
 
-        .objects = undefined,
         .devices = undefined,
         .seats = undefined,
     };
-    input_manager.objects.init();
     input_manager.devices.init();
     input_manager.seats.init();
 
@@ -88,10 +84,9 @@ pub fn init(input_manager: *InputManager) !void {
 }
 
 pub fn deinit(input_manager: *InputManager) void {
-    input_manager.global.destroy();
+    if (input_manager.global) |g| g.destroy();
 
     // This function must be called after the backend has been destroyed
-    assert(input_manager.objects.empty());
     assert(input_manager.devices.empty());
 
     input_manager.new_virtual_pointer.link.remove();
@@ -102,80 +97,6 @@ pub fn deinit(input_manager: *InputManager) void {
 
     while (input_manager.seats.first()) |seat| {
         seat.destroy();
-    }
-}
-
-fn bind(client: *wl.Client, im: *InputManager, version: u32, id: u32) void {
-    const im_v1 = river.InputManagerV1.create(client, version, id) catch {
-        client.postNoMemory();
-        log.err("out of memory", .{});
-        return;
-    };
-    im_v1.setHandler(*InputManager, handleRequest, handleDestroy, im);
-    im.objects.append(im_v1);
-    {
-        var it = im.devices.iterator(.forward);
-        while (it.next()) |device| {
-            if (!device.virtual) {
-                device.createObject(im_v1);
-            }
-        }
-    }
-}
-
-fn handleRequestInert(
-    im_v1: *river.InputManagerV1,
-    request: river.InputManagerV1.Request,
-    _: ?*anyopaque,
-) void {
-    if (request == .destroy) im_v1.destroy();
-}
-
-fn handleDestroy(im_v1: *river.InputManagerV1, _: *InputManager) void {
-    im_v1.getLink().remove();
-}
-
-fn handleRequest(
-    im_v1: *river.InputManagerV1,
-    request: river.InputManagerV1.Request,
-    im: *InputManager,
-) void {
-    switch (request) {
-        .stop => {
-            im_v1.getLink().remove();
-            im_v1.sendFinished();
-            im_v1.setHandler(?*anyopaque, handleRequestInert, null, null);
-        },
-        .destroy => {
-            im_v1.postError(.invalid_destroy, "destroy before finished event sent");
-        },
-        .create_seat => |args| {
-            var it = im.seats.iterator(.forward);
-            while (it.next()) |seat| {
-                if (mem.orderZ(u8, args.name, seat.wlr_seat.name) == .eq) {
-                    break;
-                }
-            } else {
-                Seat.create(args.name) catch |err| switch (err) {
-                    error.OutOfMemory => {
-                        im_v1.getClient().postNoMemory();
-                        log.err("out of memory", .{});
-                        return;
-                    },
-                };
-            }
-        },
-        .destroy_seat => |args| {
-            var it = im.seats.iterator(.forward);
-            _ = it.next(); // skip default seat
-            while (it.next()) |seat| {
-                if (mem.orderZ(u8, args.name, seat.wlr_seat.name) == .eq) {
-                    seat.destroying = true;
-                    server.wm.dirtyWindowing();
-                    break;
-                }
-            }
-        },
     }
 }
 
