@@ -16,7 +16,7 @@ const LibinputDevice = @import("LibinputDevice.zig");
 
 const log = std.log.scoped(.input);
 
-global: *wl.Global,
+global: ?*wl.Global = null,
 objects: wl.list.Head(river.LibinputConfigV1, null),
 devices: wl.list.Head(LibinputDevice, .link),
 
@@ -24,7 +24,7 @@ server_destroy: wl.Listener(*wl.Server) = .init(handleServerDestroy),
 
 pub fn init(config: *LibinputConfig) !void {
     config.* = .{
-        .global = try wl.Global.create(server.wl_server, river.LibinputConfigV1, 2, *LibinputConfig, config, bind),
+        .global = null, // Nile: legacy river_libinput_config_v1 disabled, see Nile.zig
         .objects = undefined,
         .devices = undefined,
     };
@@ -36,7 +36,7 @@ pub fn init(config: *LibinputConfig) !void {
 fn handleServerDestroy(listener: *wl.Listener(*wl.Server), _: *wl.Server) void {
     const config: *LibinputConfig = @fieldParentPtr("server_destroy", listener);
 
-    config.global.destroy();
+    if (config.global) |g| g.destroy();
 }
 
 fn bind(client: *wl.Client, config: *LibinputConfig, version: u32, id: u32) void {

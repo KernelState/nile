@@ -25,7 +25,7 @@ const SlotMap = @import("slotmap").SlotMap;
 
 const log = std.log.scoped(.wm);
 
-global: *wl.Global,
+global: ?*wl.Global = null,
 wlr_shell: *wlr.LayerShellV1,
 
 /// The layer shell object of the active window manager, if any
@@ -37,7 +37,7 @@ new_surface: wl.Listener(*wlr.LayerSurfaceV1) = .init(handleNewSurface),
 
 pub fn init(layer_shell: *LayerShell) !void {
     layer_shell.* = .{
-        .global = try wl.Global.create(server.wl_server, river.LayerShellV1, 1, *LayerShell, layer_shell, bind),
+        .global = null, // Nile: legacy river_layer_shell_v1 disabled, see Nile.zig
         .wlr_shell = try wlr.LayerShellV1.create(server.wl_server, 4),
         .objects = undefined,
     };
@@ -50,7 +50,7 @@ pub fn init(layer_shell: *LayerShell) !void {
 // for the wl_server to be destroyed and asserts that the new_surface event has
 // no remaining listeners.
 pub fn deinit(layer_shell: *LayerShell) void {
-    layer_shell.global.destroy();
+    if (layer_shell.global) |g| g.destroy();
     layer_shell.new_surface.link.remove();
 }
 
@@ -103,6 +103,10 @@ fn handleRequest(
 }
 
 fn supported(layer_shell: *LayerShell) bool {
+    // Nile: layer shell is always supported via direct functions.
+    // Legacy protocol check is disabled. Return true if no legacy WM is expected.
+    // If legacy protocols are re-enabled, fall back to old check.
+    if (layer_shell.global == null) return true;
     const wm_v1 = server.wm.object orelse return false;
     var it = layer_shell.objects.iterator(.forward);
     while (it.next()) |object| {

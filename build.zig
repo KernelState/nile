@@ -87,6 +87,10 @@ pub fn build(b: *Build) !void {
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-foreign/xdg-foreign-unstable-v2.xml");
 
+    // Nile: legacy river protocols are deprecated. They are still generated for
+    // backwards compatibility but their globals are not advertised by default.
+    // New code should use the Nile function API in `river/Nile.zig`.
+    // These will be removed in a future release.
     scanner.addCustomProtocol(b.path("protocol/river-window-management-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/river-xkb-bindings-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/river-layer-shell-v1.xml"));
@@ -204,6 +208,9 @@ pub fn build(b: *Build) !void {
         b.installArtifact(river);
     }
 
+    // Nile: river-protocols are deprecated. The pkgconfig file and XML install
+    // are kept for one transitional release but will be removed. New code should
+    // use `river/Nile.zig` function API instead of Wayland globals.
     {
         const wf = Build.Step.WriteFile.create(b);
         const pc_file = wf.add("river-protocols.pc", b.fmt(
@@ -213,7 +220,7 @@ pub fn build(b: *Build) !void {
             \\
             \\Name: river-protocols
             \\URL: https://isaacfreund.com/software/river
-            \\Description: Protocol files for river, a non-monolithic Wayland compositor
+            \\Description: Protocol files for river, a non-monolithic Wayland compositor (DEPRECATED - use Nile API)
             \\Version: {s}
         , .{ b.install_prefix, full_version }));
         b.getInstallStep().dependOn(&b.addInstallFile(pc_file, "share/pkgconfig/river-protocols.pc").step);

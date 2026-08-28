@@ -22,7 +22,10 @@ const WmNode = @import("WmNode.zig");
 
 const log = std.log.scoped(.wm);
 
-global: *wl.Global,
+/// Legacy Wayland global - disabled by default. Nile uses direct functions.
+/// See `Nile.zig` and `doc/nile-api.md`. Set to non-null only if you need
+/// compatibility with old external window managers.
+global: ?*wl.Global = null,
 server_destroy: wl.Listener(*wl.Server) = .init(handleServerDestroy),
 
 /// The protocol object of the active window manager, if any.
@@ -84,7 +87,9 @@ pub fn init(wm: *WindowManager) !void {
     errdefer timeout.remove();
 
     wm.* = .{
-        .global = try wl.Global.create(server.wl_server, river.WindowManagerV1, 5, *WindowManager, wm, bind),
+        .global = null, // Nile: legacy river_window_manager_v1 global disabled
+        // To re-enable for compatibility with old WMs, uncomment:
+        // .global = try wl.Global.create(server.wl_server, river.WindowManagerV1, 5, *WindowManager, wm, bind),
         .sent = .{
             .outputs = undefined,
             .seats = undefined,
@@ -98,13 +103,17 @@ pub fn init(wm: *WindowManager) !void {
     wm.sent.seats.init();
     wm.rendering_requested.list.init();
 
+    // Only add legacy init if global is enabled. For Nile, window management
+    // is done via direct function calls in `Nile.zig` without a Wayland client.
+    // The transaction system (manage/render) still runs, but is driven by
+    // `Nile.dirtyWindowing()` / `dirtyRendering()` rather than protocol messages.
     server.wl_server.addDestroyListener(&wm.server_destroy);
 }
 
 fn handleServerDestroy(listener: *wl.Listener(*wl.Server), _: *wl.Server) void {
     const wm: *WindowManager = @fieldParentPtr("server_destroy", listener);
 
-    wm.global.destroy();
+    if (wm.global) |g| g.destroy();
     wm.timeout.remove();
 }
 

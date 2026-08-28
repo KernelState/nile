@@ -16,13 +16,13 @@ const XkbBinding = @import("XkbBinding.zig");
 
 const log = std.log.scoped(.wm);
 
-global: *wl.Global,
+global: ?*wl.Global = null,
 
 server_destroy: wl.Listener(*wl.Server) = .init(handleServerDestroy),
 
 pub fn init(bindings: *XkbBindings) !void {
     bindings.* = .{
-        .global = try wl.Global.create(server.wl_server, river.XkbBindingsV1, 3, ?*anyopaque, null, bind),
+        .global = null, // Nile: legacy river_xkb_bindings_v1 disabled, see Nile.zig
     };
     server.wl_server.addDestroyListener(&bindings.server_destroy);
 }
@@ -30,7 +30,7 @@ pub fn init(bindings: *XkbBindings) !void {
 fn handleServerDestroy(listener: *wl.Listener(*wl.Server), _: *wl.Server) void {
     const bindings: *XkbBindings = @fieldParentPtr("server_destroy", listener);
 
-    bindings.global.destroy();
+    if (bindings.global) |g| g.destroy();
 }
 
 fn bind(client: *wl.Client, _: ?*anyopaque, version: u32, id: u32) void {

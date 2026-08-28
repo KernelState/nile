@@ -25,7 +25,7 @@ const default_seat_name = "default";
 
 const log = std.log.scoped(.input);
 
-global: *wl.Global,
+global: ?*wl.Global = null,
 objects: wl.list.Head(river.InputManagerV1, null),
 
 new_input: wl.Listener(*wlr.InputDevice) = .init(handleNewInput),
@@ -51,7 +51,7 @@ new_text_input: wl.Listener(*wlr.TextInputV3) = .init(handleNewTextInput),
 
 pub fn init(input_manager: *InputManager) !void {
     input_manager.* = .{
-        .global = try wl.Global.create(server.wl_server, river.InputManagerV1, 2, *InputManager, input_manager, bind),
+        .global = null, // Nile: legacy river_input_manager_v1 disabled, see Nile.zig
         // These are automatically freed when the display is destroyed
         .idle_notifier = try wlr.IdleNotifierV1.create(server.wl_server),
         .relative_pointer_manager = try wlr.RelativePointerManagerV1.create(server.wl_server),
@@ -88,7 +88,7 @@ pub fn init(input_manager: *InputManager) !void {
 }
 
 pub fn deinit(input_manager: *InputManager) void {
-    input_manager.global.destroy();
+    if (input_manager.global) |g| g.destroy();
 
     // This function must be called after the backend has been destroyed
     assert(input_manager.objects.empty());

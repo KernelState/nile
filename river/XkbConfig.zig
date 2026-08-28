@@ -16,7 +16,7 @@ const XkbKeyboard = @import("XkbKeyboard.zig");
 
 const log = std.log.scoped(.input);
 
-global: *wl.Global,
+global: ?*wl.Global = null,
 objects: wl.list.Head(river.XkbConfigV1, null),
 keymaps: wl.list.Head(XkbKeymap, .link),
 keyboards: wl.list.Head(XkbKeyboard, .link),
@@ -36,7 +36,7 @@ pub fn init(config: *XkbConfig) !void {
     defer default_keymap.unref();
 
     config.* = .{
-        .global = try wl.Global.create(server.wl_server, river.XkbConfigV1, 2, *XkbConfig, config, bind),
+        .global = null, // Nile: legacy river_xkb_config_v1 disabled, see Nile.zig
         .context = context.ref(),
         .default_keymap = default_keymap.ref(),
         .objects = undefined,
@@ -54,7 +54,7 @@ pub fn init(config: *XkbConfig) !void {
 fn handleServerDestroy(listener: *wl.Listener(*wl.Server), _: *wl.Server) void {
     const config: *XkbConfig = @fieldParentPtr("server_destroy", listener);
 
-    config.global.destroy();
+    if (config.global) |g| g.destroy();
     config.context.unref();
     config.default_keymap.unref();
 }

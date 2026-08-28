@@ -369,11 +369,15 @@ fn allowlist(server: *Server, global: *const wl.Global) bool {
 
 /// Returns true if the global is blocked for security contexts
 fn blocklist(server: *Server, global: *const wl.Global) bool {
+    // Nile: river_* globals are disabled by default. If they are null they are not blocklisted.
+    if (server.wm.global) |g| if (global == g) return true;
+    if (server.layer_shell.global) |g| if (global == g) return true;
+    if (server.xkb_bindings.global) |g| if (global == g) return true;
+    if (server.libinput_config.global) |g| if (global == g) return true;
+    if (server.xkb_config.global) |g| if (global == g) return true;
+    if (server.input_manager.global) |g| if (global == g) return true;
     return global == server.security_context_manager.global or
-        global == server.wm.global or
-        global == server.layer_shell.global or
         global == server.layer_shell.wlr_shell.global or
-        global == server.xkb_bindings.global or
         global == server.screencopy_manager.global or
         global == server.image_copy_capture_manager.global or
         global == server.output_image_capture_source_manager.global or
@@ -386,9 +390,6 @@ fn blocklist(server: *Server, global: *const wl.Global) bool {
         global == server.om.wlr_output_manager.global or
         global == server.om.power_manager.global or
         global == server.om.gamma_control_manager.global or
-        global == server.libinput_config.global or
-        global == server.xkb_config.global or
-        global == server.input_manager.global or
         global == server.input_manager.idle_notifier.global or
         global == server.input_manager.virtual_pointer_manager.global or
         global == server.input_manager.virtual_keyboard_manager.global or
