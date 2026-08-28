@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2020 The River Developers
+// SPDX-FileCopyrightText: © 2020 The nile Developers
 // SPDX-License-Identifier: GPL-3.0-only
 
 const std = @import("std");
@@ -44,7 +44,7 @@ pub fn build(b: *Build) !void {
     ) orelse false;
 
     const full_version = blk: {
-        if (b.option([]const u8, "version-string", "Override `river -version` output.")) |version_override| {
+        if (b.option([]const u8, "version-string", "Override `nile -version` output.")) |version_override| {
             break :blk version_override;
         } else if (mem.endsWith(u8, version, "-dev")) {
             var ret: u8 = undefined;
@@ -92,10 +92,10 @@ pub fn build(b: *Build) !void {
     scanner.addCustomProtocol(b.path("protocol/upstream/virtual-keyboard-unstable-v1.xml"));
 
     // Some of these versions may be out of date with what wlroots implements.
-    // This is not a problem in practice though as long as river successfully compiles.
+    // This is not a problem in practice though as long as nile successfully compiles.
     // These versions control Zig code generation and have no effect on anything internal
     // to wlroots. Therefore, the only thing that can happen due to a version being too
-    // old is that river fails to compile.
+    // old is that nile fails to compile.
     scanner.generate("wl_compositor", 4);
     scanner.generate("wl_subcompositor", 1);
     scanner.generate("wl_shm", 1);
@@ -142,7 +142,7 @@ pub fn build(b: *Build) !void {
 
     const translate_c: Translator = .init(b.dependency("translate_c", .{}), .{
         .name = "c",
-        .c_source_file = b.path("river/c.h"),
+        .c_source_file = b.path("nile/c.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -150,10 +150,10 @@ pub fn build(b: *Build) !void {
     translate_c.linkSystemLibrary("libinput", .{});
 
     {
-        const river = b.addExecutable(.{
-            .name = "river",
+        const nile = b.addExecutable(.{
+            .name = "nile",
             .root_module = b.createModule(.{
-                .root_source_file = b.path("river/main.zig"),
+                .root_source_file = b.path("nile/main.zig"),
                 .target = target,
                 .optimize = optimize,
                 .strip = strip,
@@ -162,36 +162,36 @@ pub fn build(b: *Build) !void {
             .use_llvm = use_llvm,
             .use_lld = use_llvm,
         });
-        river.root_module.addOptions("build_options", options);
+        nile.root_module.addOptions("build_options", options);
 
-        river.root_module.linkSystemLibrary("libevdev", .{});
-        river.root_module.linkSystemLibrary("libinput", .{});
-        river.root_module.linkSystemLibrary("wayland-server", .{});
-        river.root_module.linkSystemLibrary(wlroots_pkgconf, .{});
-        river.root_module.linkSystemLibrary("xkbcommon", .{});
-        river.root_module.linkSystemLibrary("pixman-1", .{});
+        nile.root_module.linkSystemLibrary("libevdev", .{});
+        nile.root_module.linkSystemLibrary("libinput", .{});
+        nile.root_module.linkSystemLibrary("wayland-server", .{});
+        nile.root_module.linkSystemLibrary(wlroots_pkgconf, .{});
+        nile.root_module.linkSystemLibrary("xkbcommon", .{});
+        nile.root_module.linkSystemLibrary("pixman-1", .{});
 
-        river.root_module.addImport("wayland", wayland);
-        river.root_module.addImport("xkbcommon", xkbcommon);
-        river.root_module.addImport("pixman", pixman);
-        river.root_module.addImport("wlroots", wlroots);
-        river.root_module.addImport("flags", flags);
-        river.root_module.addImport("slotmap", slotmap);
-        river.root_module.addImport("c", translate_c.mod);
+        nile.root_module.addImport("wayland", wayland);
+        nile.root_module.addImport("xkbcommon", xkbcommon);
+        nile.root_module.addImport("pixman", pixman);
+        nile.root_module.addImport("wlroots", wlroots);
+        nile.root_module.addImport("flags", flags);
+        nile.root_module.addImport("slotmap", slotmap);
+        nile.root_module.addImport("c", translate_c.mod);
 
-        river.root_module.addCSourceFile(.{
-            .file = b.path("river/wlroots_log_wrapper.c"),
+        nile.root_module.addCSourceFile(.{
+            .file = b.path("nile/wlroots_log_wrapper.c"),
             .flags = &.{ "-std=c99", "-O2" },
         });
 
-        river.pie = pie;
-        river.root_module.omit_frame_pointer = omit_frame_pointer;
+        nile.pie = pie;
+        nile.root_module.omit_frame_pointer = omit_frame_pointer;
 
-        b.installArtifact(river);
+        b.installArtifact(nile);
     }
 
     if (man_pages) {
-        inline for (.{"river"}) |page| {
+        inline for (.{"nile"}) |page| {
             // Workaround for https://github.com/ziglang/zig/issues/16369
             // Even passing a buffer to std.Build.Step.Run appears to be racy and occasionally deadlocks.
             const scdoc = b.addSystemCommand(&.{ "/bin/sh", "-c", "scdoc < doc/" ++ page ++ ".1.scd" });
