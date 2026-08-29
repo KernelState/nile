@@ -188,6 +188,10 @@ pub fn build(b: *Build) !void {
         nile.root_module.omit_frame_pointer = omit_frame_pointer;
 
         b.installArtifact(nile);
+
+        const runner = b.addRunArtifact(nile);
+        const run = b.step("run", "Run the compositor");
+        run.dependOn(&runner.step);
     }
 
     if (man_pages) {
