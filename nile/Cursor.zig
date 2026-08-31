@@ -606,17 +606,17 @@ pub fn processButton(cursor: *Cursor, event: *const Seat.Event.PointerButton) vo
                 // instead of .normal so the compositor can distinguish move/resize
                 // from a normal click, even when the press was a binding or op not yet committed.
                 if (cursor.seat.op) |op| {
-                    cursor.emitPointerButton(event, op.kind, op.edges, op.window);
+                    cursor.emitPointerButton(event, op.kind, op.edges, if (op.window) |r| r.get() else null);
                 } else switch (cursor.seat.wm_requested.op) {
-                    .start_pointer => |info| cursor.emitPointerButton(event, info.kind, info.edges, info.window),
+                    .start_pointer => |info| cursor.emitPointerButton(event, info.kind, info.edges, if (info.window) |r| r.get() else null),
                     else => cursor.emitPointerButton(event, .normal, .{}, cursor.windowAtCursor()),
                 }
             } else {
                 // If in an op (move/resize) use that kind for the release
                 if (cursor.seat.op) |op| {
-                    cursor.emitPointerButton(event, op.kind, op.edges, op.window);
+                    cursor.emitPointerButton(event, op.kind, op.edges, if (op.window) |r| r.get() else null);
                 } else switch (cursor.seat.wm_requested.op) {
-                    .start_pointer => |info| cursor.emitPointerButton(event, info.kind, info.edges, info.window),
+                    .start_pointer => |info| cursor.emitPointerButton(event, info.kind, info.edges, if (info.window) |r| r.get() else null),
                     else => cursor.emitPointerButton(event, .normal, .{}, cursor.windowAtCursor()),
                 }
             }
@@ -651,9 +651,9 @@ pub fn processButton(cursor: *Cursor, event: *const Seat.Event.PointerButton) vo
         } else {
             log.err("duplicate pointer button {d} release - emitting anyway with op kind if active", .{event.button});
             if (cursor.seat.op) |op| {
-                cursor.emitPointerButton(event, op.kind, op.edges, op.window);
+                cursor.emitPointerButton(event, op.kind, op.edges, if (op.window) |r| r.get() else null);
             } else switch (cursor.seat.wm_requested.op) {
-                .start_pointer => |info| cursor.emitPointerButton(event, info.kind, info.edges, info.window),
+                .start_pointer => |info| cursor.emitPointerButton(event, info.kind, info.edges, if (info.window) |r| r.get() else null),
                 else => cursor.emitPointerButton(event, .normal, .{}, cursor.windowAtCursor()),
             }
             switch (cursor.mode) {

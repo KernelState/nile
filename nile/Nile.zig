@@ -62,6 +62,7 @@ const SeatMod = @import("Seat.zig");
 const InputDevice = @import("InputDevice.zig");
 const XkbBinding = @import("XkbBinding.zig");
 pub const Compositor = @import("Compositor.zig");
+pub const Animation = @import("Animation.zig");
 
 // ---------------------------------------------------------------------------
 // Top-level controls
@@ -97,6 +98,28 @@ pub fn dirtyRendering() void {
 /// goes through `dirtyWindowing`/`dirtyWindowingLazy`.
 pub fn dirtyRenderingImmediate() void {
     server.wm.dirtyRenderingImmediate();
+}
+
+/// Animation controls — see `Animation.zig` for kinds, durations and JSON.
+/// Example: `Nile.setAnimationConfig(Animation.Config.disabled())` to disable all.
+pub fn setAnimationConfig(config: Animation.Config) void {
+    Animation.set(config);
+}
+pub fn getAnimationConfig() Animation.Config {
+    return Animation.get();
+}
+pub fn disableAllAnimations() void {
+    Animation.disableAll();
+}
+/// Load animation config from JSON file (e.g. `~/.config/nile/animations.json`).
+/// Missing file → keep defaults. Unknown fields are ignored for forward compat.
+pub fn loadAnimationConfigFromFile(path: []const u8) !void {
+    const cfg = try Animation.Config.loadFromFile(std.heap.page_allocator, path);
+    Animation.set(cfg);
+}
+/// Load from XDG config home (`$XDG_CONFIG_HOME/nile/animations.json` or `~/.config/nile/animations.json`).
+pub fn loadAnimationConfigFromXdg() void {
+    _ = Animation.loadGlobalFromXdg(std.heap.page_allocator);
 }
 
 /// Terminate the Wayland session. Equivalent to `river_window_manager_v1.exit_session`.
@@ -156,33 +179,66 @@ pub const WindowApi = struct {
     /// Propose new content dimensions for the window.
     /// `width`/`height` of 0 means "let the client choose".
     /// This mutates `wm_requested.dimensions` and dirties windowing state.
-    pub fn setDimensions(window: *WindowMod, width: u31, height: u31) void {
+    /// `animate` true means visual size change is interpolated (200ms) at
+    /// river layer; false means immediate. Grabbed windows are always immediate
+    /// regardless of flag to avoid input lag.
+    pub fn setDimensions(window: *WindowMod, width: u31, height: u31, animate: bool) void {
         window.wm_requested.dimensions = .{ .width = width, .height = height };
+        // Visual size animation — batch with position if also animating same frame
+        if (animate and window.state == .mapped) {
+            window.startSizeAnimation(@intCast(width), @intCast(height), true);
+        } else {
+            window.startSizeAnimation(@intCast(width), @intCast(height), false);
+        }
         server.wm.dirtyWindowing();
     }
 
     /// Convenience: set width/height with i32 args (negative values rejected).
-    pub fn setDimensionsChecked(window: *WindowMod, width: i32, height: i32) error{InvalidDimensions}!void {
+    pub fn setDimensionsChecked(window: *WindowMod, width: i32, height: i32, animate: bool) error{InvalidDimensions}!void {
         if (width < 0 or height < 0) return error.InvalidDimensions;
         window.wm_requested.dimensions = .{ .width = @intCast(width), .height = @intCast(height) };
+        if (animate and window.state == .mapped) {
+            window.startSizeAnimation(width, height, true);
+        } else {
+            window.startSizeAnimation(width, height, false);
+        }
         server.wm.dirtyWindowing();
     }
 
+    /// Backwards-compat wrapper without animation flag (defaults to animate=true).
+    pub fn setDimensionsNoAnim(window: *WindowMod, width: u31, height: u31) void {
+        setDimensions(window, width, height, true);
+    }
+
     /// Set the window's position in global compositor space (rendering state).
-    pub fn setPosition(window: *WindowMod, x: i32, y: i32) void {
+    /// `animate` true interpolates at river layer (200ms easeOutCubic), false
+    /// applies immediately. Grabbed windows (seat.op.window) are forced immediate
+    /// even if animate=true to prevent cursor lag. Batched: rapid pos+size changes
+    /// in same arrange are coalesced into one animation from current visual to
+    /// final target.
+    pub fn setPosition(window: *WindowMod, x: i32, y: i32, animate: bool) void {
         window.rendering_requested.x = x;
         window.rendering_requested.y = y;
-        server.wm.dirtyRendering();
+        if (animate) {
+            window.startPosAnimation(x, y, true);
+            // Animation drives visual; still need to ensure frame is scheduled.
+            // Timer will tick, but also mark rendering dirty for final commit.
+            server.wm.dirtyRendering();
+        } else {
+            window.startPosAnimation(x, y, false);
+            server.wm.dirtyRendering();
+        }
     }
 
     /// Immediate variant — update scene graph synchronously without waiting
     /// for idle. Use for per-motion drag/move. Still records
     /// `rendering_requested` but also applies `box` + `wlr_scene_tree`
     /// position now, so next frame shows new position without a
-    /// `dirtyRendering` idle round-trip.
+    /// `dirtyRendering` idle round-trip. Always animate=false.
     pub fn setPositionImmediate(window: *WindowMod, x: i32, y: i32) void {
         window.rendering_requested.x = x;
         window.rendering_requested.y = y;
+        window.startPosAnimation(x, y, false);
         window.applyRenderingImmediate();
         // Clear any pending rendering dirty since we flushed it.
         if (server.wm.rendering_scheduled.dirty) {
@@ -524,7 +580,7 @@ pub const SeatApi = struct {
                 .y = @intFromFloat(seat.cursor.wlr_cursor.y),
                 .kind = kind,
                 .edges = edges,
-                .window = window,
+                .window = if (window) |w| w.ref else null,
                 .win_x = win_x,
                 .win_y = win_y,
                 .win_width = win_w,
@@ -533,7 +589,7 @@ pub const SeatApi = struct {
             seat.cursor.opStartPointer();
         }
         // Also queue via wm_requested for consistency; manageFinish will see op != null and skip duplicate creation
-        seat.wm_requested.op = .{ .start_pointer = .{ .kind = kind, .edges = edges, .window = window } };
+        seat.wm_requested.op = .{ .start_pointer = .{ .kind = kind, .edges = edges, .window = if (window) |w| w.ref else null } };
         server.wm.dirtyWindowing();
     }
 

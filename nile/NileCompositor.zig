@@ -88,6 +88,23 @@ pub const Node = union(enum) {
         }
     }
 
+    /// Like getNode but uses allocated boxes from ratios/output_box, not stale window.box.
+    /// Prevents misselection when windows are mid-animation (visual boxes lag final layout).
+    pub fn getNodeAllocated(self: *Node, x: i32, y: i32, root: *const Node, output_box: Box) *Node {
+        switch (self.*) {
+            .leaf => return self,
+            .branch => |b| {
+                const first_box = root.allocatedBoxFor(b.first, output_box) orelse b.first.getBox();
+                const point = Box{ .x = x, .y = y, .w = 0, .h = 0 };
+                if (first_box.contains(&point)) {
+                    return b.first.getNodeAllocated(x, y, root, output_box);
+                } else {
+                    return b.second.getNodeAllocated(x, y, root, output_box);
+                }
+            },
+        }
+    }
+
     /// Find the leaf node that contains `win` by pointer identity.
     /// Returns null if `win` is not in this subtree. No coordinate
     /// comparison — prevents misselection when boxes are stale or overlap.
@@ -389,7 +406,7 @@ pub const NileCompositor = struct {
                 .y = 0,
                 .w = @intCast(box.width),
                 .h = @intCast(box.height),
-            }, &self.root.?);
+            }, &self.root.?, true);
         } else {
             log.debug("Rebuilding root", .{});
             self.arrange();
@@ -428,7 +445,7 @@ pub const NileCompositor = struct {
                 .y = 0,
                 .w = @intCast(box.width),
                 .h = @intCast(box.height),
-            }, r);
+            }, r, true);
         }
     }
 
@@ -476,17 +493,26 @@ pub const NileCompositor = struct {
                 .y = 0,
                 .w = @intCast(box.width),
                 .h = @intCast(box.height),
-            }, r);
+            }, r, true);
         }
         Nile.dirtyWindowing();
         Nile.dirtyRendering();
     }
 
-    fn arrangeNode(rbox: Box, n: *const Node) void {
+    fn arrangeNode(rbox: Box, n: *const Node, animate: bool) void {
         switch (n.*) {
             .leaf => |win| {
-                Nile.Window.setPosition(win, @intCast(rbox.x), @intCast(rbox.y));
-                Nile.Window.setDimensions(win, @intCast(rbox.w), @intCast(rbox.h));
+                // Window being dragged never animates — check isGrabbed inside
+                // startPosAnimation, but also force animate=false for its own
+                // target to guarantee immediate response.
+                const is_grabbed = blk: {
+                    var it = @import("main.zig").server.input_manager.seats.iterator(.forward);
+                    while (it.next()) |seat| if (seat.op) |op| if (op.window) |r| if (r.get()) |w| if (w == win) break :blk true;
+                    break :blk false;
+                };
+                const do_animate = if (is_grabbed) false else animate;
+                Nile.Window.setPosition(win, @intCast(rbox.x), @intCast(rbox.y), do_animate);
+                Nile.Window.setDimensions(win, @intCast(rbox.w), @intCast(rbox.h), do_animate);
             },
             .branch => |b| {
                 switch (b.orientation) {
@@ -496,13 +522,13 @@ pub const NileCompositor = struct {
                             .y = rbox.y,
                             .w = rbox.w,
                             .h = @floor(rbox.h * b.ratio),
-                        }, b.first);
+                        }, b.first, animate);
                         arrangeNode(.{
                             .x = rbox.x,
                             .y = @as(i32, @intFromFloat(rbox.y + @floor(rbox.h * b.ratio))),
                             .w = rbox.w,
                             .h = @as(i32, @intFromFloat(@floor(rbox.h * (1.0 - b.ratio)))),
-                        }, b.second);
+                        }, b.second, animate);
                     },
                     .horizontal => {
                         arrangeNode(.{
@@ -510,13 +536,13 @@ pub const NileCompositor = struct {
                             .y = rbox.y,
                             .w = @floor(rbox.w * b.ratio),
                             .h = rbox.h,
-                        }, b.first);
+                        }, b.first, animate);
                         arrangeNode(.{
                             .x = @as(i32, @intFromFloat(rbox.x + @floor(rbox.w * b.ratio))),
                             .y = rbox.y,
                             .w = @as(i32, @intFromFloat(@floor(rbox.w * (1.0 - b.ratio)))),
                             .h = rbox.h,
-                        }, b.second);
+                        }, b.second, animate);
                     },
                 }
             },
@@ -574,9 +600,9 @@ pub const NileCompositor = struct {
                 // release should still end it and reinsert the window. This covers
                 // the race where release arrives before manageFinish created seat.op.
                 const op_info: ?struct { kind: Compositor.PointerButtonKind, window: ?*Window } = if (seat.op) |op|
-                    .{ .kind = op.kind, .window = op.window }
+                    .{ .kind = op.kind, .window = if (op.window) |r| r.get() else null }
                 else switch (seat.wm_requested.op) {
-                    .start_pointer => |info| .{ .kind = info.kind, .window = info.window },
+                    .start_pointer => |info| .{ .kind = info.kind, .window = if (info.window) |r| r.get() else null },
                     else => null,
                 };
                 const op_kind = if (op_info) |info| info.kind else kind;
@@ -597,7 +623,10 @@ pub const NileCompositor = struct {
                     if (self.root) |*r| {
                         const drop_x: i32 = @as(i32, @intFromFloat(@floor(x)));
                         const drop_y: i32 = @as(i32, @intFromFloat(@floor(y)));
-                        const target = r.getNode(drop_x, drop_y);
+                        const target = if (Nile.Output.primary()) |out| blk: {
+                            const output_box: Box = .{ .x = 0, .y = 0, .w = @intCast(Nile.Output.effectiveBox(out).width), .h = @intCast(Nile.Output.effectiveBox(out).height) };
+                            break :blk r.getNodeAllocated(drop_x, drop_y, r, output_box);
+                        } else r.getNode(drop_x, drop_y);
                         if (op_kind == .move) {
                             target.append(self.gpa, win, drop_x, drop_y);
                         }
@@ -625,7 +654,7 @@ pub const NileCompositor = struct {
                 .y = 0,
                 .w = @intCast(box.width),
                 .h = @intCast(box.height),
-            }, r);
+            }, r, true);
         }
     }
 
@@ -641,7 +670,7 @@ pub const NileCompositor = struct {
         _ = delta_x;
         _ = delta_y;
         _ = time_msec;
-        if (seat.op) |op| if (op.window) |win| {
+        if (seat.op) |op| if (op.window) |ref| if (ref.get()) |win| {
             switch (op.kind) {
                 .move => {
                     const new_x = op.win_x + @as(i32, @intFromFloat(x)) - op.start_x;
@@ -652,7 +681,7 @@ pub const NileCompositor = struct {
                     if (win.state == .mapped or win.state == .closing) {
                         Nile.Window.setPositionImmediate(win, new_x, new_y);
                     } else {
-                        Nile.Window.setPosition(win, new_x, new_y);
+                        Nile.Window.setPosition(win, new_x, new_y, false);
                         Nile.dirtyRendering();
                     }
                 },
@@ -720,7 +749,7 @@ pub const NileCompositor = struct {
                             if (!resized) return;
                             // diagonal edge where one axis already resized
                             // but other axis has no matching branch — keep horiz resize
-                            arrangeNode(output_box, &self.root.?);
+                            arrangeNode(output_box, &self.root.?, false);
                             Nile.dirtyWindowingLazy();
                             Nile.dirtyRenderingImmediate();
                             return;
@@ -734,7 +763,10 @@ pub const NileCompositor = struct {
                     if (!resized) return;
 
                     // Re-arrange whole root immediately with fresh ratios.
-                    arrangeNode(output_box, &self.root.?);
+                    // During drag, animate=false to avoid lag — batch visual updates
+                    // and keep grabbed window immediate. After drop, final arrange
+                    // will animate=true.
+                    arrangeNode(output_box, &self.root.?, false);
                     // Exception for motion: windowing (dimensions/configure) is still
                     // lazy/idle so it doesn't block motion coalescing, but rendering
                     // (position) is flushed synchronously on every motion for

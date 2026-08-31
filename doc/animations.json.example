@@ -1,0 +1,32 @@
+{
+  "enabled": true,
+  "window_open": {
+    "kind": "scfade",
+    "duration_ms": 220,
+    "easing": "ease_out_cubic",
+    "scale_from": 0.94
+  },
+  "window_close": {
+    "kind": "fade",
+    "duration_ms": 180,
+    "easing": "ease_out_cubic",
+    "scale_from": 0.94
+  },
+  "tiling": {
+    "kind": "slide",
+    "duration_ms": 200,
+    "easing": "ease_out_cubic"
+  },
+  "popup_open": {
+    "kind": "fade",
+    "duration_ms": 150,
+    "easing": "ease_out_cubic",
+    "scale_from": 0.94
+  },
+  "popup_close": {
+    "kind": "fade",
+    "duration_ms": 120,
+    "easing": "ease_out_cubic",
+    "scale_from": 0.94
+  }
+}

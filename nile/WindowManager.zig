@@ -75,6 +75,8 @@ rendering_requested: struct {
 
 dirty_idle: ?*wl.EventSource = null,
 
+animation_timer: ?*wl.EventSource = null,
+
 timeout: *wl.EventSource,
 
 pub fn init(wm: *WindowManager) !void {
@@ -110,7 +112,38 @@ fn handleServerDestroy(listener: *wl.Listener(*wl.Server), _: *wl.Server) void {
     const wm: *WindowManager = @fieldParentPtr("server_destroy", listener);
 
     if (wm.global) |g| g.destroy();
+    if (wm.animation_timer) |t| t.remove();
     wm.timeout.remove();
+}
+
+pub fn ensureAnimationTimer(wm: *WindowManager) void {
+    if (wm.animation_timer != null) return;
+    const event_loop = server.wl_server.getEventLoop();
+    wm.animation_timer = event_loop.addTimer(*WindowManager, handleAnimationTick, wm) catch {
+        log.err("failed to create animation timer", .{});
+        return;
+    };
+    // First tick ~16ms (60fps) — batch window so rapid arrange calls coalesce
+    wm.animation_timer.?.timerUpdate(16) catch {};
+}
+
+fn handleAnimationTick(wm: *WindowManager) c_int {
+    const ts = util.timestamp();
+    const now: i64 = @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+    var any_active = false;
+    var it = wm.windows.iterator();
+    while (it.next()) |window| {
+        if (window.tickAnimation(now)) any_active = true;
+    }
+    if (any_active) {
+        wm.animation_timer.?.timerUpdate(16) catch {};
+    } else {
+        if (wm.animation_timer) |t| {
+            t.remove();
+            wm.animation_timer = null;
+        }
+    }
+    return 0;
 }
 
 pub fn ensureWindowing(wm: *WindowManager) bool {
@@ -351,19 +384,23 @@ fn renderFinish(wm: *WindowManager) void {
     {
         var it = wm.windows.iterator();
         while (it.next()) |window| {
+            const close_anim_active = window.animation.active and window.animation.kind == .close;
             // If a window is unmapped during a render sequence, we need to retain the saved
             // buffers until after the next manage sequence (in which the closed event will
-            // be sent) for frame perfection.
-            if (window.state != .closing) {
+            // be sent) for frame perfection. Keep saved while close anim is running.
+            if (window.state != .closing and !close_anim_active) {
                 window.surfaces.dropSaved();
             }
             // Ensure windows that are closed but not yet destroyed don't have
-            // their borders/decorations rendered.
-            if (window.state == .init) {
+            // their borders/decorations rendered. Don't hide while close anim is fading.
+            if (window.state == .init and !close_anim_active) {
                 window.tree.node.reparent(server.scene.hidden_tree);
             }
-            if (window.impl == .destroying) {
+            if (window.impl == .destroying and !close_anim_active) {
                 window.destroy();
+            } else if (window.impl == .destroying and close_anim_active) {
+                // Keep close animation alive — ensure timer is running
+                wm.ensureAnimationTimer();
             }
         }
     }

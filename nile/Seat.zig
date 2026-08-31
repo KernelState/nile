@@ -203,7 +203,7 @@ wm_requested: struct {
         start_pointer: struct {
             kind: @import("Compositor.zig").PointerButtonKind = .move,
             edges: Window.Edges = .{},
-            window: ?*Window = null,
+            window: ?Window.Ref = null,
         },
         end,
     } = .none,
@@ -228,7 +228,7 @@ op: ?struct {
     y: i32,
     kind: @import("Compositor.zig").PointerButtonKind = .normal,
     edges: Window.Edges = .{},
-    window: ?*Window = null,
+    window: ?Window.Ref = null,
     /// Window geometry at start of op (for move/resize delta computation)
     win_x: i32 = 0,
     win_y: i32 = 0,
@@ -565,10 +565,10 @@ pub fn manageFinish(seat: *Seat) void {
         .none => {},
         .start_pointer => |info| if (seat.op == null) {
             log.debug("start seat op pointer kind={s}", .{@tagName(info.kind)});
-            const win_x: i32, const win_y: i32, const win_w: u31, const win_h: u31 = if (info.window) |win|
+            const win_x: i32, const win_y: i32, const win_w: u31, const win_h: u31 = if (info.window) |ref| if (ref.get()) |win|
                 .{ win.box.x, win.box.y, @intCast(@max(0, win.box.width)), @intCast(@max(0, win.box.height)) }
             else
-                .{ 0, 0, 0, 0 };
+                .{ 0, 0, 0, 0 } else .{ 0, 0, 0, 0 };
             seat.op = .{
                 .input = .pointer,
                 .start_x = @intFromFloat(seat.cursor.wlr_cursor.x),

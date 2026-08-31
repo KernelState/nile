@@ -148,6 +148,10 @@ pub fn main(init: std.process.Init.Minimal) anyerror!void {
     try server.init(runtime_xwayland);
     defer server.deinit();
 
+    // Load animation config from XDG (e.g. ~/.config/nile/animations.json) if present.
+    // Missing file keeps defaults; JSON is forward-compatible (unknown fields ignored).
+    _ = @import("Animation.zig").loadGlobalFromXdg(util.gpa);
+
     var compositor: NileCompositor.NileCompositor = .{};
     @import("Compositor.zig").set(@import("Compositor.zig").initCompositor(
         NileCompositor.NileCompositor,
@@ -298,6 +302,8 @@ const LogScope = enum {
     lock,
     wm,
     xdg,
+    xdg_popup,
+    animation,
     xwayland,
 };
 

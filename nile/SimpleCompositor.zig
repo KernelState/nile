@@ -171,8 +171,8 @@ pub const SimpleCompositor = struct {
         var i: usize = 0;
         for (wins.items) |win| {
             const y = box.y + @as(i32, @intCast(i)) * h;
-            Nile.Window.setPosition(win, box.x, y);
-            Nile.Window.setDimensions(win, @intCast(box.width), @intCast(h));
+            Nile.Window.setPosition(win, box.x, y, true);
+            Nile.Window.setDimensions(win, @intCast(box.width), @intCast(h), true);
             i += 1;
         }
         Nile.dirtyWindowing();
@@ -222,7 +222,7 @@ pub const SimpleCompositor = struct {
             },
             .released => switch (kind) {
                 .move, .resize => {
-                    if (seat.op) |op| if (op.window) |win| if (kind == .resize) Nile.Window.setResizing(win, false);
+                    if (seat.op) |op| if (op.window) |ref| if (ref.get()) |win| if (kind == .resize) Nile.Window.setResizing(win, false);
                     Nile.Seat.opEnd(seat);
                 },
                 .normal => {},
@@ -236,12 +236,13 @@ pub const SimpleCompositor = struct {
         _ = dx;
         _ = dy;
         _ = time_msec;
-        if (seat.op) |op| if (op.window) |win| {
+        if (seat.op) |op| if (op.window) |ref| if (ref.get()) |win| {
             switch (op.kind) {
                 .move => {
                     const new_x = op.win_x + @as(i32, @intFromFloat(x)) - op.start_x;
                     const new_y = op.win_y + @as(i32, @intFromFloat(y)) - op.start_y;
-                    Nile.Window.setPosition(win, new_x, new_y);
+                    // Grabbed window never animates
+                    Nile.Window.setPosition(win, new_x, new_y, false);
                     Nile.dirtyRendering();
                 },
                 .resize => {
@@ -263,8 +264,8 @@ pub const SimpleCompositor = struct {
                     }
                     if (new_w < 20) new_w = 20;
                     if (new_h < 20) new_h = 20;
-                    Nile.Window.setPosition(win, new_x, new_y);
-                    Nile.Window.setDimensions(win, @intCast(new_w), @intCast(new_h));
+                    Nile.Window.setPosition(win, new_x, new_y, false);
+                    Nile.Window.setDimensions(win, @intCast(new_w), @intCast(new_h), false);
                     Nile.dirtyWindowingLazy();
                     Nile.dirtyRendering();
                 },
