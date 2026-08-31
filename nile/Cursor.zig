@@ -478,6 +478,14 @@ pub fn processMotionAbsolute(cursor: *Cursor, event: *const Seat.Event.PointerMo
 }
 
 fn emitPointerButton(cursor: *Cursor, event: *const Seat.Event.PointerButton, kind: Compositor.PointerButtonKind, edges: Window.Edges, window: ?*Window) void {
+    log.debug("emit pointer_button {s} button={d} kind={s} at {d:.0},{d:.0} win={?s}", .{
+        @tagName(event.state),
+        event.button,
+        @tagName(kind),
+        cursor.wlr_cursor.x,
+        cursor.wlr_cursor.y,
+        if (window) |w| w.getTitle() else null,
+    });
     Compositor.notify(.{ .pointer_button = .{
         .seat = cursor.seat,
         .window = window,
@@ -594,18 +602,35 @@ pub fn processButton(cursor: *Cursor, event: *const Seat.Event.PointerButton) vo
         if (result) |kv| {
             if (kv.value) |binding| {
                 binding.released();
-                cursor.emitPointerButton(event, .normal, .{}, cursor.windowAtCursor());
+                // If an op is active (or pending via wm_requested), this release ends the op – emit op kind
+                // instead of .normal so the compositor can distinguish move/resize
+                // from a normal click, even when the press was a binding or op not yet committed.
+                if (cursor.seat.op) |op| {
+                    cursor.emitPointerButton(event, op.kind, op.edges, op.window);
+                } else switch (cursor.seat.wm_requested.op) {
+                    .start_pointer => |info| cursor.emitPointerButton(event, info.kind, info.edges, info.window),
+                    else => cursor.emitPointerButton(event, .normal, .{}, cursor.windowAtCursor()),
+                }
             } else {
                 // If in an op (move/resize) use that kind for the release
                 if (cursor.seat.op) |op| {
                     cursor.emitPointerButton(event, op.kind, op.edges, op.window);
-                } else {
-                    cursor.emitPointerButton(event, .normal, .{}, cursor.windowAtCursor());
+                } else switch (cursor.seat.wm_requested.op) {
+                    .start_pointer => |info| cursor.emitPointerButton(event, info.kind, info.edges, info.window),
+                    else => cursor.emitPointerButton(event, .normal, .{}, cursor.windowAtCursor()),
                 }
             }
 
             switch (cursor.mode) {
-                .passthrough => unreachable,
+                .passthrough => {
+                    // Can happen if Nile.Seat.opEnd was called synchronously inside
+                    // the compositor's pointer_button handler (immediate op end)
+                    // which already set mode to passthrough via cursor.opEndPointer.
+                    // Just ensure passthrough state is refreshed.
+                    if (cursor.pressed.count() == 0) {
+                        cursor.passthrough(event.time_msec);
+                    }
+                },
                 .drag, .down, .ignore => {
                     if (cursor.mode != .ignore) {
                         _ = cursor.seat.wlr_seat.pointerNotifyButton(event.time_msec, event.button, event.state);
@@ -624,8 +649,32 @@ pub fn processButton(cursor: *Cursor, event: *const Seat.Event.PointerButton) vo
                 },
             }
         } else {
-            log.err("ignoring duplicate pointer button {d} release", .{event.button});
-            return;
+            log.err("duplicate pointer button {d} release - emitting anyway with op kind if active", .{event.button});
+            if (cursor.seat.op) |op| {
+                cursor.emitPointerButton(event, op.kind, op.edges, op.window);
+            } else switch (cursor.seat.wm_requested.op) {
+                .start_pointer => |info| cursor.emitPointerButton(event, info.kind, info.edges, info.window),
+                else => cursor.emitPointerButton(event, .normal, .{}, cursor.windowAtCursor()),
+            }
+            switch (cursor.mode) {
+                .passthrough => {},
+                .drag, .down, .ignore => {
+                    if (cursor.mode != .ignore) {
+                        _ = cursor.seat.wlr_seat.pointerNotifyButton(event.time_msec, event.button, event.state);
+                    }
+                    if (cursor.pressed.count() == 0) {
+                        log.debug("exiting cursor mode {s} (duplicate release)", .{@tagName(cursor.mode)});
+                        cursor.mode = .passthrough;
+                        cursor.passthrough(event.time_msec);
+                    }
+                },
+                .op => {
+                    if (cursor.pressed.count() == 0) {
+                        cursor.seat.wm_scheduled.op_release = true;
+                        server.wm.dirtyWindowing();
+                    }
+                },
+            }
         }
     }
 }

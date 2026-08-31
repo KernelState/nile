@@ -147,6 +147,34 @@ pub fn dirtyRendering(wm: *WindowManager) void {
     wm.addDirtyIdle();
 }
 
+/// Immediate variant — apply pending rendering_requested directly to the
+/// scene graph without waiting for the next idle. Safe to call from
+/// `onPointerMotion` for move/drag. Only touches rendering state
+/// (position/hidden/border/clip), never `wm_requested` dimensions.
+/// Falls back to normal `dirtyRendering` if a manage is in progress
+/// where geometry is driven by output state.
+pub fn dirtyRenderingImmediate(wm: *WindowManager) void {
+    // If idle, we can still handle synchronously to avoid one idle tick.
+    // If in-flight, we also handle synchronously — rendering changes
+    // do not require client ack and can run concurrent to configure wait.
+    wm.applyPendingRenderingImmediate();
+    // Clear the scheduled dirty flag since we flushed it synchronously;
+    // keep any pending windowing dirty untouched.
+    if (wm.rendering_scheduled.dirty) {
+        wm.cleanRendering();
+    }
+}
+
+fn applyPendingRenderingImmediate(wm: *WindowManager) void {
+    var it = wm.rendering_requested.list.iterator(.forward);
+    while (it.next()) |node| {
+        switch (node.get()) {
+            .window => |window| window.applyRenderingImmediate(),
+            .shell_surface => |shell_surface| shell_surface.renderFinish(),
+        }
+    }
+}
+
 pub fn cleanRendering(wm: *WindowManager) void {
     wm.rendering_scheduled.dirty = false;
     wm.removeDirtyIdle();
@@ -164,7 +192,7 @@ fn addDirtyIdle(wm: *WindowManager) void {
 }
 
 fn removeDirtyIdle(wm: *WindowManager) void {
-    if (!wm.scheduled.dirty and !wm.rendering_scheduled.dirty) {
+    if (!wm.scheduled.dirty and !wm.scheduled.dirty_lazy and !wm.rendering_scheduled.dirty) {
         if (wm.dirty_idle) |event_source| {
             event_source.remove();
             wm.dirty_idle = null;

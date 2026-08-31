@@ -190,25 +190,25 @@ wm_sent: struct {
 } = .{},
 link_sent: wl.list.Link,
 
-    /// Windowing state requested by the wm.
-    wm_requested: struct {
-        focus: union(enum) {
-            none,
-            clear,
-            window: Window.Ref,
-            shell_surface: *ShellSurface,
-        } = .none,
-        op: union(enum) {
-            none,
-            start_pointer: struct {
-                kind: @import("Compositor.zig").PointerButtonKind = .move,
-                edges: Window.Edges = .{},
-                window: ?*Window = null,
-            },
-            end,
-        } = .none,
-        pointer_warp: ?struct { x: i32, y: i32 } = null,
-    } = .{},
+/// Windowing state requested by the wm.
+wm_requested: struct {
+    focus: union(enum) {
+        none,
+        clear,
+        window: Window.Ref,
+        shell_surface: *ShellSurface,
+    } = .none,
+    op: union(enum) {
+        none,
+        start_pointer: struct {
+            kind: @import("Compositor.zig").PointerButtonKind = .move,
+            edges: Window.Edges = .{},
+            window: ?*Window = null,
+        },
+        end,
+    } = .none,
+    pointer_warp: ?struct { x: i32, y: i32 } = null,
+} = .{},
 
 xkb_bindings: wl.list.Head(XkbBinding, .link),
 pointer_bindings: wl.list.Head(PointerBinding, .link),
@@ -216,25 +216,25 @@ pointer_bindings: wl.list.Head(PointerBinding, .link),
 /// Multiple physical mice are handled by the same Cursor
 cursor: Cursor,
 
-    op: ?struct {
-        sent_release: bool = false,
-        input: enum {
-            pointer,
-        },
-        /// Coordinates of the cursor/touch point/etc. at the start of the operation.
-        start_x: i32,
-        start_y: i32,
-        x: i32,
-        y: i32,
-        kind: @import("Compositor.zig").PointerButtonKind = .normal,
-        edges: Window.Edges = .{},
-        window: ?*Window = null,
-        /// Window geometry at start of op (for move/resize delta computation)
-        win_x: i32 = 0,
-        win_y: i32 = 0,
-        win_width: u31 = 0,
-        win_height: u31 = 0,
-    } = null,
+op: ?struct {
+    sent_release: bool = false,
+    input: enum {
+        pointer,
+    },
+    /// Coordinates of the cursor/touch point/etc. at the start of the operation.
+    start_x: i32,
+    start_y: i32,
+    x: i32,
+    y: i32,
+    kind: @import("Compositor.zig").PointerButtonKind = .normal,
+    edges: Window.Edges = .{},
+    window: ?*Window = null,
+    /// Window geometry at start of op (for move/resize delta computation)
+    win_x: i32 = 0,
+    win_y: i32 = 0,
+    win_width: u31 = 0,
+    win_height: u31 = 0,
+} = null,
 
 relay: InputRelay,
 
@@ -363,6 +363,56 @@ pub fn destroy(seat: *Seat) void {
 pub fn queueEvent(seat: *Seat, event: Event) !void {
     seat.handleActivity();
 
+    // Fast-path for pointer motion: coalesce and deliver even while
+    // the window manager is in `manage`/`inflight_configures`/`render`.
+    // This gives per-wayland-call latency for motion/drag without
+    // waiting for the transaction to complete. Other events still queue.
+    // Exception for motion: deliver even while a transaction is pending
+    // (`state != idle` or `scheduled.dirty`) by handling rendering
+    // synchronously. Only rendering state is touched (see
+    // `dirtyRenderingImmediate` / `setPositionImmediate`); windowing
+    // (dimensions/configure) still goes through the normal idle.
+    const fast_motion = server.wm.state != .idle or server.wm.scheduled.dirty;
+    switch (event) {
+        .pointer_motion_relative => |ev| {
+            if (seat.event_queue.len > 0) {
+                if (seat.event_queue.backPtr()) |last| {
+                    if (last.* == .pointer_motion_relative) {
+                        last.pointer_motion_relative.delta_x += ev.delta_x;
+                        last.pointer_motion_relative.delta_y += ev.delta_y;
+                        last.pointer_motion_relative.unaccel_dx += ev.unaccel_dx;
+                        last.pointer_motion_relative.unaccel_dy += ev.unaccel_dy;
+                        last.pointer_motion_relative.time_msec = ev.time_msec;
+                        last.pointer_motion_relative.mapping = ev.mapping;
+                        if (fast_motion) {
+                            const merged = seat.event_queue.popBack().?.pointer_motion_relative;
+                            seat.cursor.processMotionRelative(&merged);
+                        }
+                        return;
+                    }
+                }
+            }
+            if (fast_motion) {
+                seat.cursor.processMotionRelative(&ev);
+                return;
+            }
+        },
+        .pointer_motion_absolute => |ev| {
+            if (seat.event_queue.len > 0) {
+                if (seat.event_queue.backPtr()) |last| {
+                    if (last.* == .pointer_motion_absolute) {
+                        _ = seat.event_queue.popBack();
+                    }
+                }
+            }
+            if (fast_motion) {
+                seat.cursor.processMotionAbsolute(&ev);
+                return;
+            }
+        },
+        else => {},
+    }
+
     seat.event_queue.pushBackBounded(event) catch {
         log.err("dropping {s} event, no space in event queue", .{@tagName(event)});
         return error.QueueFull;
@@ -370,6 +420,26 @@ pub fn queueEvent(seat: *Seat, event: Event) !void {
 
     if (server.wm.state == .idle) {
         seat.processEvents();
+    }
+}
+
+/// Drain only pointer-motion events while transaction is active.
+/// Used after renderFinish to flush any coalesced motions that arrived
+/// during `inflight_configures`.
+pub fn processMotionFast(seat: *Seat) void {
+    while (seat.event_queue.len > 0) {
+        const front = seat.event_queue.front() orelse break;
+        switch (front) {
+            .pointer_motion_relative => |ev| {
+                _ = seat.event_queue.popFront();
+                seat.cursor.processMotionRelative(&ev);
+            },
+            .pointer_motion_absolute => |ev| {
+                _ = seat.event_queue.popFront();
+                seat.cursor.processMotionAbsolute(&ev);
+            },
+            else => break,
+        }
     }
 }
 
@@ -427,6 +497,28 @@ pub fn manageStart(seat: *Seat) void {
 
 pub fn manageFinish(seat: *Seat) void {
     seat.xkb_bindings_seat.manageFinish();
+
+    // Nile: Cursor sets wm_scheduled.op_release when all buttons are released
+    // in op mode. The actual release is delivered as a pointer_button event
+    // with kind=.move/.resize via the event queue. Do not auto-end here –
+    // that would clear seat.op before the queued pointer_button is processed,
+    // causing it to arrive as .normal and never reinsert the window.
+    // Just clear the flag; the compositor's pointer_button handler will call
+    // opEnd. Keep a fallback only for the case where the compositor truly
+    // ignores the release (no pending button and op still active on next
+    // manage).
+    if (seat.wm_scheduled.op_release) {
+        seat.wm_scheduled.op_release = false;
+        // Always defer — the pointer_button released event has already been
+        // delivered to the compositor via Cursor.processButton.emitPointerButton
+        // before this flag was set. Ending seat.op here would clear it before
+        // the compositor's handler (NileCompositor) sees seat.op != null and
+        // would swallow the release (no reinsert, no opEnd). The compositor
+        // is responsible for calling Nile.Seat.opEnd() in its released handler.
+        // No immediate fallback — if the compositor truly ignores the release,
+        // the op will be cleared on next explicit opEnd or seat destroy.
+        log.debug("op_release deferred: pointer_button release will end op", .{});
+    }
 
     if (server.lock_manager.state != .unlocked) return;
 

@@ -227,38 +227,38 @@ popup_tree: *wlr.SceneTree,
 capture_scene: *wlr.Scene,
 capture_source: ?*wlr.ExtImageCaptureSourceV1 = null,
 
-    /// State to be sent to the wm in the next manage sequence.
-    wm_scheduled: struct {
-        dimensions_hint: DimensionsHint = .{},
-        decoration_hint: DecorationHint = .only_supports_csd,
-        show_window_menu_requested: ?struct { x: i32, y: i32 } = null,
-        /// Set back to no_request at the end of each update sequence
-        fullscreen_requested: FullscreenRequest = .no_request,
-        maximize_requested: enum {
-            no_request,
-            maximize,
-            unmaximize,
-        } = .no_request,
-        minimize_requested: bool = false,
-        dirty_app_id: bool = false,
-        dirty_title: bool = false,
-        pointer_move_requested: ?*Seat = null,
-        pointer_resize_requested: ?struct {
-            seat: *Seat,
-            edges: Edges,
-        } = null,
-        capture_session_count: u32 = 0,
-    } = .{},
+/// State to be sent to the wm in the next manage sequence.
+wm_scheduled: struct {
+    dimensions_hint: DimensionsHint = .{},
+    decoration_hint: DecorationHint = .only_supports_csd,
+    show_window_menu_requested: ?struct { x: i32, y: i32 } = null,
+    /// Set back to no_request at the end of each update sequence
+    fullscreen_requested: FullscreenRequest = .no_request,
+    maximize_requested: enum {
+        no_request,
+        maximize,
+        unmaximize,
+    } = .no_request,
+    minimize_requested: bool = false,
+    dirty_app_id: bool = false,
+    dirty_title: bool = false,
+    pointer_move_requested: ?*Seat = null,
+    pointer_resize_requested: ?struct {
+        seat: *Seat,
+        edges: Edges,
+    } = null,
+    capture_session_count: u32 = 0,
+} = .{},
 
-    /// State sent to the wm in the latest manage sequence.
-    /// This state is only kept around in order to avoid sending redundant events
-    /// to the wm.
-    wm_sent: struct {
-        dimensions_hint: DimensionsHint = .{},
-        decoration_hint: DecorationHint = .only_supports_csd,
-        parent: ?Window.Ref = null,
-        capture_session_count: u32 = 0,
-    } = .{},
+/// State sent to the wm in the latest manage sequence.
+/// This state is only kept around in order to avoid sending redundant events
+/// to the wm.
+wm_sent: struct {
+    dimensions_hint: DimensionsHint = .{},
+    decoration_hint: DecorationHint = .only_supports_csd,
+    parent: ?Window.Ref = null,
+    capture_session_count: u32 = 0,
+} = .{},
 
 /// Windowing state requested by the wm.
 wm_requested: WmRequested = .init,
@@ -277,12 +277,12 @@ rendering_scheduled: struct {
     resend_dimensions: bool = false,
 } = .{},
 
-    /// State sent to the wm in the latest render sequence.
-    rendering_sent: struct {
-        width: u31 = 0,
-        height: u31 = 0,
-        presentation_hint: PresentationMode = .vsync,
-    } = .{},
+/// State sent to the wm in the latest render sequence.
+rendering_sent: struct {
+    width: u31 = 0,
+    height: u31 = 0,
+    presentation_hint: PresentationMode = .vsync,
+} = .{},
 
 /// Rendering state requested by the wm.
 rendering_requested: RenderingRequested = .init,
@@ -517,8 +517,6 @@ pub fn makeInert(window: *Window) void {
     }
 }
 
-
-
 /// Applies window management state from the window manager and sends a configure
 /// to the window if necessary.
 /// Returns true if the configure should be waited for by the transaction system.
@@ -681,6 +679,53 @@ fn presentationHint(window: *Window) PresentationMode {
         .vsync => .vsync,
         _ => unreachable,
     };
+}
+
+/// Apply pending `rendering_requested` directly to the scene graph
+/// without waiting for a transaction. Only rendering state is touched
+/// (position/hidden/border/clip). Safe to call during `manage` /
+/// `inflight_configures` for move/drag. Width/height come from
+/// `rendering_sent` (no client configure needed for position).
+pub fn applyRenderingImmediate(window: *Window) void {
+    if (window.impl == .destroying) return;
+    const requested = &window.rendering_requested;
+    // Width/height are driven by configure; don't change them here.
+    // Position, visibility and borders can be applied immediately.
+    const enabled = !requested.hidden and (window.state == .mapped or window.state == .closing);
+    window.tree.node.setEnabled(enabled);
+    window.popup_tree.node.setEnabled(enabled);
+
+    var clip: wlr.Box = requested.clip;
+    var content_clip: wlr.Box = requested.content_clip;
+    if (window.wm_requested.fullscreen) |output| {
+        // Fullscreen position is output-driven; don't override with requested
+        // but still ensure decorations/borders reflect immediate state.
+        window.box.x = output.sent.x;
+        window.box.y = output.sent.y;
+        window.fullscreen_background.node.setEnabled(true);
+        const width, const height = output.sent.dimensions();
+        window.fullscreen_background.setSize(width, height);
+        clip = .{ .x = 0, .y = 0, .width = width, .height = height };
+        content_clip = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+        inline for (.{ "left", "right", "top", "bottom" }) |edge| {
+            @field(window.border, edge).node.setEnabled(false);
+        }
+    } else {
+        // Immediate position — no output commit needed, scene damage is automatic
+        window.box.x = requested.x;
+        window.box.y = requested.y;
+        window.fullscreen_background.node.setEnabled(false);
+        window.drawBorders();
+    }
+    window.tree.node.setPosition(window.box.x, window.box.y);
+    window.popup_tree.node.setPosition(window.box.x, window.box.y);
+    window.applySurfaceClip(&clip, &content_clip);
+    inline for (.{ &window.decorations_above, &window.decorations_below }) |decorations| {
+        var it = decorations.iterator(.forward);
+        while (it.next()) |decoration| {
+            decoration.renderFinish(&clip);
+        }
+    }
 }
 
 pub fn renderFinish(window: *Window) void {

@@ -90,6 +90,15 @@ pub fn dirtyRendering() void {
     server.wm.dirtyRendering();
 }
 
+/// Immediate variant — apply pending rendering state to the scene graph
+/// synchronously without waiting for the next idle. Use from
+/// `onPointerMotion` for move/drag to achieve per-wayland-call latency.
+/// Only rendering state is flushed; windowing (dimensions/configure) still
+/// goes through `dirtyWindowing`/`dirtyWindowingLazy`.
+pub fn dirtyRenderingImmediate() void {
+    server.wm.dirtyRenderingImmediate();
+}
+
 /// Terminate the Wayland session. Equivalent to `river_window_manager_v1.exit_session`.
 pub fn exitSession() void {
     server.wl_server.terminate();
@@ -166,6 +175,21 @@ pub const WindowApi = struct {
         server.wm.dirtyRendering();
     }
 
+    /// Immediate variant — update scene graph synchronously without waiting
+    /// for idle. Use for per-motion drag/move. Still records
+    /// `rendering_requested` but also applies `box` + `wlr_scene_tree`
+    /// position now, so next frame shows new position without a
+    /// `dirtyRendering` idle round-trip.
+    pub fn setPositionImmediate(window: *WindowMod, x: i32, y: i32) void {
+        window.rendering_requested.x = x;
+        window.rendering_requested.y = y;
+        window.applyRenderingImmediate();
+        // Clear any pending rendering dirty since we flushed it.
+        if (server.wm.rendering_scheduled.dirty) {
+            server.wm.cleanRendering();
+        }
+    }
+
     /// Hide the window (and its borders/decorations). No-op if already hidden.
     pub fn hide(window: *WindowMod) void {
         window.rendering_requested.hidden = true;
@@ -198,7 +222,8 @@ pub const WindowApi = struct {
 
     /// Set which capabilities to advertise to the window (window_menu, maximize, fullscreen, minimize).
     pub fn setCapabilities(window: *WindowMod, caps: WindowMod.Configure) void {
-        _ = window; _ = caps;
+        _ = window;
+        _ = caps;
         // Caller can set individual fields via wm_requested.capabilities directly if needed.
         // Provided for symmetry with protocol's set_capabilities.
         server.wm.dirtyWindowing();
@@ -449,27 +474,66 @@ pub const SeatApi = struct {
     /// Deprecated: use `opStartMove`/`opStartResize` or handle `pointer_button`
     /// events directly. This now starts a move-kind op.
     pub fn opStartPointer(seat: *SeatMod) void {
-        seat.wm_requested.op = .{ .start_pointer = .{ .kind = .move, .edges = .{}, .window = null } };
-        server.wm.dirtyWindowing();
+        startOpImmediate(seat, .move, .{}, null);
     }
 
     /// Start an interactive move for `window` on `seat`. Compositor should
     /// call this after receiving a `pointer_button` with `kind == .normal`
     /// when it decides the hold should become a move (e.g. Mod+drag).
     pub fn opStartMove(seat: *SeatMod, window: ?*WindowMod) void {
-        seat.wm_requested.op = .{ .start_pointer = .{ .kind = .move, .edges = .{}, .window = window } };
-        server.wm.dirtyWindowing();
+        startOpImmediate(seat, .move, .{}, window);
     }
 
     /// Start an interactive resize for `window` on `seat`.
     pub fn opStartResize(seat: *SeatMod, window: ?*WindowMod, edges: WindowMod.Edges) void {
-        seat.wm_requested.op = .{ .start_pointer = .{ .kind = .resize, .edges = edges, .window = window } };
-        server.wm.dirtyWindowing();
+        startOpImmediate(seat, .resize, edges, window);
     }
 
     /// End current seat operation.
     pub fn opEnd(seat: *SeatMod) void {
-        seat.wm_requested.op = .end;
+        // End immediately if op exists, otherwise queue for next manage.
+        // Immediate path also clears any pending start_pointer so manageFinish
+        // does not recreate the op after we already ended it.
+        if (seat.op != null) {
+            seat.opEnd();
+            seat.wm_requested.op = .none;
+        } else {
+            // If a start was pending but never committed, cancel it
+            switch (seat.wm_requested.op) {
+                .start_pointer => seat.wm_requested.op = .none,
+                else => seat.wm_requested.op = .end,
+            }
+            server.wm.dirtyWindowing();
+        }
+    }
+
+    fn startOpImmediate(seat: *SeatMod, kind: @import("Compositor.zig").PointerButtonKind, edges: WindowMod.Edges, window: ?*WindowMod) void {
+        // Create op synchronously so the subsequent pointer_button released
+        // sees seat.op != null even if release arrives before next manage
+        // (race that previously caused "no move released event").
+        if (seat.op == null) {
+            const win_x: i32, const win_y: i32, const win_w: u31, const win_h: u31 = if (window) |win|
+                .{ win.box.x, win.box.y, @intCast(@max(0, win.box.width)), @intCast(@max(0, win.box.height)) }
+            else
+                .{ 0, 0, 0, 0 };
+            seat.op = .{
+                .input = .pointer,
+                .start_x = @intFromFloat(seat.cursor.wlr_cursor.x),
+                .start_y = @intFromFloat(seat.cursor.wlr_cursor.y),
+                .x = @intFromFloat(seat.cursor.wlr_cursor.x),
+                .y = @intFromFloat(seat.cursor.wlr_cursor.y),
+                .kind = kind,
+                .edges = edges,
+                .window = window,
+                .win_x = win_x,
+                .win_y = win_y,
+                .win_width = win_w,
+                .win_height = win_h,
+            };
+            seat.cursor.opStartPointer();
+        }
+        // Also queue via wm_requested for consistency; manageFinish will see op != null and skip duplicate creation
+        seat.wm_requested.op = .{ .start_pointer = .{ .kind = kind, .edges = edges, .window = window } };
         server.wm.dirtyWindowing();
     }
 
@@ -541,7 +605,7 @@ pub const Input = struct {
     pub fn setRepeat(device: *InputDevice, rate: i32, delay: i32) error{InvalidRate}!void {
         if (rate < 0 or delay < 0) return error.InvalidRate;
         if (device.wlr_device.type != .keyboard) return;
-        const kbd: * @import("Keyboard.zig") = @ptrCast(@alignCast(device.wlr_device.data));
+        const kbd: *@import("Keyboard.zig") = @ptrCast(@alignCast(device.wlr_device.data));
         kbd.setRepeatInfo(@intCast(rate), @intCast(delay));
     }
 

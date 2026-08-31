@@ -18,10 +18,10 @@ const Output = @import("Output.zig");
 const XkbBinding = @import("XkbBinding.zig");
 
 pub const Box = struct {
-    w: u32,
-    h: u32,
-    x: u32,
-    y: u32,
+    w: i32,
+    h: i32,
+    x: i32,
+    y: i32,
 
     pub fn contains(self: *const Box, other: *const Box) bool {
         return (self.x <= other.x and self.y <= other.y and self.x + self.w >= other.x + other.w and self.y + self.h >= other.y + other.h);
@@ -43,21 +43,76 @@ pub const Node = union(enum) {
         /// first item ratio in the split
         /// can be changed via resize
         ratio: f64 = 0.5,
+
+        /// Offset ratio by signed pixels delta, positive grows `first`.
+        /// Clamped 0.05..0.95 so divider never collapses a child.
+        /// Using pixel delta directly (not `delta / parent_dim`) keeps speed
+        /// independent of tile size — large tiles no longer feel sluggish — and
+        /// caller is responsible for only touching the immediate parent.
+        pub fn offsetRatio(self: *Branch, delta_px: i32) void {
+            // 0.002 ≈ 1/500; tuned so ~500px drag traverses full ratio range,
+            // feels immediate and tracks mouse without the `delta/box` size-dependence.
+            // For perfect 1:1 mouse tracking use `delta / parent_dim` instead.
+            self.ratio += @as(f64, @floatFromInt(delta_px)) * 0.002;
+            self.ratio = @max(0.05, @min(0.95, self.ratio));
+        }
+
+        /// Variant that is exactly 1:1 with mouse when parent dim is known.
+        pub fn offsetRatioDim(self: *Branch, delta_px: i32, dim: i32) void {
+            if (dim == 0) return;
+            self.ratio += @as(f64, @floatFromInt(delta_px)) / @as(f64, @floatFromInt(dim));
+            self.ratio = @max(0.05, @min(0.95, self.ratio));
+        }
+
+        /// Shallow shell: set ratio from absolute cursor vs parent (window-cursor difference).
+        /// More accurate than delta accumulation — no drift. Caller provides cursor pos and parent box.
+        pub fn setRatioFromCursor(self: *Branch, cursor_pos: f64, parent_pos: i32, parent_dim: i32) void {
+            if (parent_dim == 0) return;
+            const desired = (cursor_pos - @as(f64, @floatFromInt(parent_pos))) / @as(f64, @floatFromInt(parent_dim));
+            self.ratio = @max(0.05, @min(0.95, desired));
+        }
     };
 
-    pub fn getNode(self: *Node, x: u32, y: u32) *Node {
+    pub fn getNode(self: *Node, x: i32, y: i32) *Node {
         switch (self.*) {
             .leaf => return self,
             .branch => |b| {
-                const n1 = b.first.getNode(x, y);
-                const n2 = b.second.getNode(x, y);
-                std.debug.assert(n1.* == .leaf);
-                std.debug.assert(n2.* == .leaf);
-                if (n1.leaf.box.x + n1.leaf.box.width > x and n1.leaf.box.y + n1.leaf.box.height > y and n1.leaf.box.x <= x and n1.leaf.box.y <= y) {
-                    return n1;
+                const b1 = b.first.getBox();
+                const point = Box{ .x = x, .y = y, .w = 0, .h = 0 };
+                if (b1.contains(&point)) {
+                    return b.first.getNode(x, y);
                 } else {
-                    return n2;
+                    return b.second.getNode(x, y);
                 }
+            },
+        }
+    }
+
+    /// Find the leaf node that contains `win` by pointer identity.
+    /// Returns null if `win` is not in this subtree. No coordinate
+    /// comparison — prevents misselection when boxes are stale or overlap.
+    pub fn find(self: *Node, win: *Window) ?*Node {
+        switch (self.*) {
+            .leaf => |l| {
+                if (l == win) return self;
+                return null;
+            },
+            .branch => |b| {
+                if (b.first.find(win)) |found| return found;
+                return b.second.find(win);
+            },
+        }
+    }
+
+    /// Find the parent branch of `target` by pointer identity.
+    /// `target` must be a direct node pointer inside this tree.
+    pub fn findParent(self: *Node, target: *Node) ?*Node {
+        switch (self.*) {
+            .leaf => return null,
+            .branch => |b| {
+                if (b.first == target or b.second == target) return self;
+                if (b.first.findParent(target)) |found| return found;
+                return b.second.findParent(target);
             },
         }
     }
@@ -72,15 +127,9 @@ pub const Node = union(enum) {
     }
 
     pub fn getBox(self: *const Node) Box {
-        var box: Box = .{
-            .y = 0,
-            .x = 0,
-            .w = 0,
-            .h = 0,
-        };
         switch (self.*) {
             .leaf => |win| {
-                box = .{
+                return .{
                     .w = @intCast(win.box.width),
                     .h = @intCast(win.box.height),
                     .x = @intCast(win.box.x),
@@ -89,40 +138,72 @@ pub const Node = union(enum) {
             },
             .branch => |b| {
                 const b1 = b.first.getBox();
-                box.w += b1.w;
-                box.h += b1.h;
-                if (b1.x < box.x)
-                    box.x = b1.x;
-                if (b1.y < box.y)
-                    box.y = b1.y;
                 const b2 = b.second.getBox();
-                box.w += b2.w;
-                box.h += b2.h;
-                if (b2.x < box.x)
-                    box.x = b2.x;
-                if (b2.y < box.y)
-                    box.y = b2.y;
+                const min_x = @min(b1.x, b2.x);
+                const min_y = @min(b1.y, b2.y);
+                const max_x = @max(b1.x + b1.w, b2.x + b2.w);
+                const max_y = @max(b1.y + b1.h, b2.y + b2.h);
+                return .{
+                    .x = min_x,
+                    .y = min_y,
+                    .w = max_x - min_x,
+                    .h = max_y - min_y,
+                };
             },
         }
-        return box;
+    }
+
+    /// Allocated box for `target` as given by current ratios and `rbox`.
+    /// Unlike `getBox` (which reads stale `window.box`), this is computed
+    /// from the tiling ratios so it has no transaction delay and never
+    /// overshoots when the cursor crosses node boundaries.
+    pub fn allocatedBoxFor(self: *const Node, target: *const Node, rbox: Box) ?Box {
+        if (self == target) return rbox;
+        switch (self.*) {
+            .leaf => return null,
+            .branch => |b| {
+                const first_rbox: Box = switch (b.orientation) {
+                    .vertical => .{
+                        .x = rbox.x,
+                        .y = rbox.y,
+                        .w = rbox.w,
+                        .h = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.h)) * b.ratio)),
+                    },
+                    .horizontal => .{
+                        .x = rbox.x,
+                        .y = rbox.y,
+                        .w = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.w)) * b.ratio)),
+                        .h = rbox.h,
+                    },
+                };
+                const second_rbox: Box = switch (b.orientation) {
+                    .vertical => .{
+                        .x = rbox.x,
+                        .y = @as(i32, @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.y)) + @as(f64, @floatFromInt(rbox.h)) * b.ratio))),
+                        .w = rbox.w,
+                        .h = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.h)) * (1.0 - b.ratio))),
+                    },
+                    .horizontal => .{
+                        .x = @as(i32, @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.x)) + @as(f64, @floatFromInt(rbox.w)) * b.ratio))),
+                        .y = rbox.y,
+                        .w = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.w)) * (1.0 - b.ratio))),
+                        .h = rbox.h,
+                    },
+                };
+                if (b.first.allocatedBoxFor(target, first_rbox)) |box| return box;
+                return b.second.allocatedBoxFor(target, second_rbox);
+            },
+        }
     }
 
     pub fn parentOf(self: *Node, other: *Node) *Node {
-        if (self.* == .leaf)
-            return self;
-
-        const b = other.getBox();
-        const b1 = self.branch.first.getBox();
-
-        const ret = if (b1.contains(&b))
-            self.branch.first.parentOf(other)
-        else
-            self.branch.second.parentOf(other);
-
-        if (ret.* == .leaf)
-            return self;
-
-        return ret;
+        if (self.findParent(other)) |p| return p;
+        // Fallback for callers that expect a non-null return when
+        // `other` is not found (e.g. construct path) — return self
+        // so old leaf-check `if (ret.* == .leaf) return self` stays
+        // compatible, but log for debugging.
+        if (self.* == .leaf) return self;
+        return self;
     }
 
     /// Remove all windows that don't exist in the tree
@@ -149,49 +230,51 @@ pub const Node = union(enum) {
     }
 
     /// add a new leaf to the tree
-    pub fn append(self: *Node, alloc: std.mem.Allocator, new: *Window, orientation: ?Orientation) void {
+    /// drop_x/drop_y is the cursor position where the window was dropped (for tiling placement).
+    /// orientation is the split direction for the new branch, or null for horizontal default.
+    pub fn append(self: *Node, alloc: std.mem.Allocator, new: *Window, drop_x: i32, drop_y: i32) void {
         switch (self.*) {
             .leaf => |l| {
                 const b1 = Box{
                     .x = @intCast(l.box.x),
                     .y = @intCast(l.box.y),
-                    .w = @intCast(if (orientation == .horizontal) @divFloor(l.box.width, 2) else l.box.width),
-                    .h = @intCast(if (orientation == .vertical) @divFloor(l.box.height, 2) else l.box.height),
+                    .w = @intCast(if (l.box.width > l.box.height) @divFloor(l.box.width, 2) else l.box.width),
+                    .h = @intCast(if (l.box.height > l.box.width) @divFloor(l.box.height, 2) else l.box.height),
                 };
                 const n = alloc.create(Node) catch unreachable;
                 n.* = .{ .leaf = new };
                 const no = alloc.create(Node) catch unreachable;
                 no.* = self.*;
                 if (b1.contains(&.{
-                    .x = @intCast(new.box.x),
-                    .y = @intCast(new.box.y),
+                    .x = drop_x,
+                    .y = drop_y,
                     .w = 0,
                     .h = 0,
                 })) {
                     self.* = .{ .branch = .{
                         .first = n,
                         .second = no,
-                        .orientation = orientation orelse .horizontal,
+                        .orientation = if (l.box.width > l.box.height) .horizontal else .vertical,
                     } };
                 } else {
                     self.* = .{ .branch = .{
                         .first = no,
                         .second = n,
-                        .orientation = orientation orelse .horizontal,
+                        .orientation = if (l.box.width > l.box.height) .horizontal else .vertical,
                     } };
                 }
             },
             .branch => |b| {
                 const b1 = b.first.getBox();
                 if (b1.contains(&.{
-                    .x = @intCast(new.box.x),
-                    .y = @intCast(new.box.y),
+                    .x = drop_x,
+                    .y = drop_y,
                     .w = 0,
                     .h = 0,
                 })) {
-                    b.first.append(alloc, new, if (b.orientation == .horizontal) .vertical else .horizontal);
+                    b.first.append(alloc, new, drop_x, drop_y);
                 } else {
-                    b.second.append(alloc, new, if (b.orientation == .horizontal) .vertical else .horizontal);
+                    b.second.append(alloc, new, drop_x, drop_y);
                 }
             },
         }
@@ -239,16 +322,18 @@ pub fn construct(alloc: std.mem.Allocator, wins: []const *Window) ?Node {
             ))));
         const nnode = alloc.create(Node) catch unreachable;
         nnode.* = .{ .leaf = win };
+        const old = alloc.create(Node) catch unreachable;
+        old.* = node.*;
         if (dist_start > dist_end) {
             node.* = .{ .branch = .{
-                .first = node,
+                .first = old,
                 .second = nnode,
                 .orientation = if (cur) .horizontal else .vertical,
             } };
         } else {
             node.* = .{ .branch = .{
                 .first = nnode,
-                .second = node,
+                .second = old,
                 .orientation = if (cur) .horizontal else .vertical,
             } };
         }
@@ -293,11 +378,12 @@ pub const NileCompositor = struct {
         const out = Nile.Output.primary() orelse return;
         const box = Nile.Output.effectiveBox(out);
         if (self.root) |*r| {
-            r.append(self.gpa, win, null);
-            log.debug("New node: {}", .{@intFromPtr(r.getNode(
-                @intCast(win.box.x),
-                @intCast(win.box.y),
-            ))});
+            const drop_x: i32 = @intCast(@max(0, win.box.x));
+            const drop_y: i32 = @intCast(@max(0, win.box.y));
+            r.append(self.gpa, win, drop_x, drop_y);
+            if (r.find(win)) |node| {
+                log.debug("New node: {}", .{@intFromPtr(node)});
+            }
             arrangeNode(.{
                 .x = 0,
                 .y = 0,
@@ -321,13 +407,28 @@ pub const NileCompositor = struct {
     }
 
     fn onWindowDestroy(self: *NileCompositor, win: *Window) void {
-        if (self.root.? == .leaf)
-            self.root = null;
+        const root = self.root orelse return;
+        if (root == .leaf) {
+            if (root.leaf == win) {
+                self.root = null;
+                log.debug("Root deleted", .{});
+            }
+            return;
+        }
         if (self.root) |*r| {
-            const p = r.parentOf(
-                r.getNode(@intCast(win.box.x), @intCast(win.box.y)),
-            );
-            p.pop(p.branch.first.* == .leaf and p.branch.first.leaf == win);
+            const out = Nile.Output.primary() orelse return;
+            const box = Nile.Output.effectiveBox(out);
+            // Pointer identity: find node that owns `win`, no coordinates.
+            const n = r.find(win) orelse return;
+            const p = r.findParent(n) orelse return;
+            const is_first = p.branch.first == n;
+            p.pop(is_first);
+            arrangeNode(.{
+                .x = 0,
+                .y = 0,
+                .w = @intCast(box.width),
+                .h = @intCast(box.height),
+            }, r);
         }
     }
 
@@ -364,15 +465,18 @@ pub const NileCompositor = struct {
         while (it.next()) |win| {
             wins.append(self.gpa, win) catch unreachable;
         }
-        if (wins.items.len == 0) return;
+        if (wins.items.len == 0) {
+            self.root = null;
+            return;
+        }
         self.root = construct(self.gpa, wins.items);
-        if (self.root) |r| {
+        if (self.root) |*r| {
             arrangeNode(.{
                 .x = 0,
                 .y = 0,
                 .w = @intCast(box.width),
                 .h = @intCast(box.height),
-            }, &r);
+            }, r);
         }
         Nile.dirtyWindowing();
         Nile.dirtyRendering();
@@ -395,9 +499,9 @@ pub const NileCompositor = struct {
                         }, b.first);
                         arrangeNode(.{
                             .x = rbox.x,
-                            .y = @as(u32, @intFromFloat(rbox.y + @floor(rbox.h * b.ratio))),
+                            .y = @as(i32, @intFromFloat(rbox.y + @floor(rbox.h * b.ratio))),
                             .w = rbox.w,
-                            .h = @as(u32, @intFromFloat(@floor(rbox.h * (1.0 - b.ratio)))),
+                            .h = @as(i32, @intFromFloat(@floor(rbox.h * (1.0 - b.ratio)))),
                         }, b.second);
                     },
                     .horizontal => {
@@ -408,9 +512,9 @@ pub const NileCompositor = struct {
                             .h = rbox.h,
                         }, b.first);
                         arrangeNode(.{
-                            .x = @as(u32, @intFromFloat(rbox.x + @floor(rbox.w * b.ratio))),
+                            .x = @as(i32, @intFromFloat(rbox.x + @floor(rbox.w * b.ratio))),
                             .y = rbox.y,
-                            .w = @as(u32, @intFromFloat(@floor(rbox.w * (1.0 - b.ratio)))),
+                            .w = @as(i32, @intFromFloat(@floor(rbox.w * (1.0 - b.ratio)))),
                             .h = rbox.h,
                         }, b.second);
                     },
@@ -436,8 +540,6 @@ pub const NileCompositor = struct {
         edges: Window.Edges,
         time_msec: u32,
     ) void {
-        _ = x;
-        _ = y;
         _ = time_msec;
         _ = button;
         switch (state) {
@@ -449,9 +551,8 @@ pub const NileCompositor = struct {
                     if (self.root == null or self.root.? == .leaf)
                         return;
                     Nile.Seat.opStartMove(seat, win);
-                    const n = self.root.?.getNode(@intCast(win.box.x), @intCast(win.box.y));
-                    const p = self.root.?.parentOf(n);
-                    log.debug("parent: {}, node: {}", .{ @intFromPtr(p), @intFromPtr(n) });
+                    const n = self.root.?.find(win) orelse return;
+                    const p = self.root.?.findParent(n) orelse return;
                     p.pop(p.branch.first == n);
                 },
                 .resize => if (window) |win| {
@@ -467,33 +568,64 @@ pub const NileCompositor = struct {
                     Nile.Window.raiseToTop(win);
                 },
             },
-            .released => switch (kind) {
-                .move, .resize => {
-                    // End interactive op (pointer release for move/resize)
-                    if (seat.op) |op| if (op.window) |win| {
-                        if (kind == .resize) Nile.Window.setResizing(win, false);
-                        log.info("pointer_button {s} released", .{@tagName(kind)});
-                        if (self.root) |*r| {
-                            const n = r.getNode(@intCast(win.box.x), @intCast(win.box.y));
-                            if (kind == .move) {
-                                const rbox = Box{
-                                    .w = @intCast(n.leaf.box.width),
-                                    .h = @intCast(n.leaf.box.height),
-                                    .x = @intCast(n.leaf.box.x),
-                                    .y = @intCast(n.leaf.box.y),
-                                };
-                                n.* = construct(self.gpa, &.{ n.leaf, win }).?;
-                                arrangeNode(rbox, n);
-                            } else {}
-                        } else {
-                            self.root = .{ .leaf = win };
+            .released => {
+                // Use seat.op's kind, or pending wm_requested, not the event kind — Cursor may emit
+                // .normal for a binding release, but if an op is active/pending the
+                // release should still end it and reinsert the window. This covers
+                // the race where release arrives before manageFinish created seat.op.
+                const op_info: ?struct { kind: Compositor.PointerButtonKind, window: ?*Window } = if (seat.op) |op|
+                    .{ .kind = op.kind, .window = op.window }
+                else switch (seat.wm_requested.op) {
+                    .start_pointer => |info| .{ .kind = info.kind, .window = info.window },
+                    else => null,
+                };
+                const op_kind = if (op_info) |info| info.kind else kind;
+                const op_win = if (op_info) |info| info.window else null;
+                if (op_info != null) {
+                    log.info(
+                        "released {s} (op {s}), where op's nullity is {}",
+                        .{ @tagName(kind), @tagName(op_kind), (seat.op == null) },
+                    );
+                } else {
+                    log.info("released {s} (no op) at {d:.0},{d:.0}", .{ @tagName(kind), x, y });
+                }
+                // End interactive op (pointer release for move/resize)
+                if (op_win) |win| {
+                    if (op_kind == .resize) Nile.Window.setResizing(win, false);
+                    log.info("pointer_button {s} released at {d:.0},{d:.0}", .{ @tagName(op_kind), x, y });
+                    log.info("Nullability of root {}", .{(self.root == null)});
+                    if (self.root) |*r| {
+                        const drop_x: i32 = @as(i32, @intFromFloat(@floor(x)));
+                        const drop_y: i32 = @as(i32, @intFromFloat(@floor(y)));
+                        const target = r.getNode(drop_x, drop_y);
+                        if (op_kind == .move) {
+                            target.append(self.gpa, win, drop_x, drop_y);
                         }
-                    };
-                    Nile.Seat.opEnd(seat);
-                },
-                .normal => {},
+                        const win_node = r.find(win) orelse target;
+                        log.info("added moving window to the tree at drop {d},{d}\n\twindow is at node {} with parent {}", .{
+                            drop_x,
+                            drop_y,
+                            @intFromPtr(win_node),
+                            @intFromPtr(target),
+                        });
+                    } else {
+                        log.info("set moving window as root", .{});
+                        self.root = .{ .leaf = win };
+                    }
+                }
+                if (seat.op != null or op_info != null) Nile.Seat.opEnd(seat);
             },
             else => {},
+        }
+        if (self.root) |*r| {
+            const out = Nile.Output.primary() orelse return;
+            const box = Nile.Output.effectiveBox(out);
+            arrangeNode(.{
+                .x = 0,
+                .y = 0,
+                .w = @intCast(box.width),
+                .h = @intCast(box.height),
+            }, r);
         }
     }
 
@@ -506,6 +638,7 @@ pub const NileCompositor = struct {
         delta_y: f64,
         time_msec: u32,
     ) void {
+        _ = delta_x;
         _ = delta_y;
         _ = time_msec;
         if (seat.op) |op| if (op.window) |win| {
@@ -513,49 +646,105 @@ pub const NileCompositor = struct {
                 .move => {
                     const new_x = op.win_x + @as(i32, @intFromFloat(x)) - op.start_x;
                     const new_y = op.win_y + @as(i32, @intFromFloat(y)) - op.start_y;
-                    Nile.Window.setPosition(win, new_x, new_y);
-                    Nile.dirtyRendering();
+                    // Fast-path: update scene graph synchronously every
+                    // wayland motion, bypassing the idle transaction.
+                    // Falls back to dirtyRendering if window is not yet mapped.
+                    if (win.state == .mapped or win.state == .closing) {
+                        Nile.Window.setPositionImmediate(win, new_x, new_y);
+                    } else {
+                        Nile.Window.setPosition(win, new_x, new_y);
+                        Nile.dirtyRendering();
+                    }
                 },
                 .resize => {
-                    const n = self.root.?.getNode(@intCast(win.box.x), @intCast(win.box.y));
-                    const dx = @as(i32, @intFromFloat(x)) - op.start_x;
-                    const dy = @as(i32, @intFromFloat(y)) - op.start_y;
-                    if (dx == 0 and dy == 0)
-                        return;
-                    var parents = std.ArrayList(*Node).empty;
-                    defer parents.deinit(self.gpa);
-                    parents.append(self.gpa, n) catch unreachable;
-                    while (parents.items.len != 0 and parents.items[parents.items.len - 1] != &self.root.?) {
-                        parents.append(self.gpa, self.root.?.parentOf(&parents.items[parents.items.len - 1].*)) catch unreachable;
-                    }
-                    var iter = std.mem.reverseIterator(parents.items);
-                    var i = parents.items.len - 1;
-                    while (iter.next()) |p| : (i -= 1) {
-                        if (i == 0) break;
-                        var mul: i32 = -1;
-                        if (p.branch.first == parents.items[i - 1]) {
-                            mul = 1;
-                        }
-                        const box = p.getBox();
-                        switch (p.branch.orientation) {
-                            .horizontal => p.branch.ratio += @as(f64, @floatFromInt(dx)) / @as(f64, @floatFromInt(box.w)) * mul,
-                            .vertical => p.branch.ratio += (@as(f64, @floatFromInt(dy)) / @as(f64, @floatFromInt(box.h))) * mul,
-                        }
-                    }
+                    const n = self.root.?.find(win) orelse return;
+
                     const out = Nile.Output.primary() orelse return;
-                    arrangeNode(.{
+                    const effective = Nile.Output.effectiveBox(out);
+                    const output_box: Box = .{
                         .x = 0,
                         .y = 0,
-                        .w = @intCast(out.current.box().width),
-                        .h = @intCast(out.current.box().height),
-                    }, &self.root.?);
-                    Nile.dirtyWindowing();
-                    Nile.dirtyRendering();
+                        .w = @intCast(effective.width),
+                        .h = @intCast(effective.height),
+                    };
+
+                    const has_h = op.edges.left or op.edges.right;
+                    const has_v = op.edges.top or op.edges.bottom;
+                    if (!has_h and !has_v) return;
+
+                    // Walk ancestors to find the branch(es) whose orientation
+                    // matches the dragged edge. This fixes nested cases where
+                    // a window's immediate parent orientation doesn't match the
+                    // edge (e.g. leaf inside vertical split but dragging right
+                    // edge must resize the ancestor horizontal split). Also
+                    // handles branch-branch splits (children are branches, not
+                    // leaves) — ratio and allocatedBoxFor work for any node.
+                    var horiz_branch: ?*Node = null;
+                    var vert_branch: ?*Node = null;
+                    var horiz_box: ?Box = null;
+                    var vert_box: ?Box = null;
+
+                    var cur: ?*Node = n;
+                    while (cur) |node| {
+                        const parent = self.root.?.findParent(node) orelse break;
+                        const pb = self.root.?.allocatedBoxFor(parent, output_box) orelse parent.getBox();
+                        if (pb.w == 0 or pb.h == 0) {
+                            cur = parent;
+                            continue;
+                        }
+                        if (horiz_branch == null and has_h and parent.branch.orientation == .horizontal) {
+                            horiz_branch = parent;
+                            horiz_box = pb;
+                        }
+                        if (vert_branch == null and has_v and parent.branch.orientation == .vertical) {
+                            vert_branch = parent;
+                            vert_box = pb;
+                        }
+                        if (has_h and !has_v and horiz_branch != null) break;
+                        if (!has_h and has_v and vert_branch != null) break;
+                        if (has_h and has_v and horiz_branch != null and vert_branch != null) break;
+                        cur = parent;
+                    }
+
+                    var resized = false;
+                    if (has_h) {
+                        const b = horiz_branch orelse return;
+                        const pb = horiz_box orelse b.getBox();
+                        const desired = (x - @as(f64, @floatFromInt(pb.x))) / @as(f64, @floatFromInt(pb.w));
+                        if (desired < 0 or desired > 1) return;
+                        b.branch.setRatioFromCursor(x, pb.x, pb.w);
+                        resized = true;
+                    }
+                    if (has_v) {
+                        const b = vert_branch orelse {
+                            if (!resized) return;
+                            // diagonal edge where one axis already resized
+                            // but other axis has no matching branch — keep horiz resize
+                            arrangeNode(output_box, &self.root.?);
+                            Nile.dirtyWindowingLazy();
+                            Nile.dirtyRenderingImmediate();
+                            return;
+                        };
+                        const pb = vert_box orelse b.getBox();
+                        const desired = (y - @as(f64, @floatFromInt(pb.y))) / @as(f64, @floatFromInt(pb.h));
+                        if (desired < 0 or desired > 1) return;
+                        b.branch.setRatioFromCursor(y, pb.y, pb.h);
+                        resized = true;
+                    }
+                    if (!resized) return;
+
+                    // Re-arrange whole root immediately with fresh ratios.
+                    arrangeNode(output_box, &self.root.?);
+                    // Exception for motion: windowing (dimensions/configure) is still
+                    // lazy/idle so it doesn't block motion coalescing, but rendering
+                    // (position) is flushed synchronously on every motion for
+                    // per-wayland-call latency. The fast-path in Seat.queueEvent
+                    // guarantees this handler runs even during inflight_configures.
+                    Nile.dirtyWindowingLazy();
+                    Nile.dirtyRenderingImmediate();
                 },
                 .normal => {},
             }
-        } else {
-            _ = delta_x;
         };
     }
 

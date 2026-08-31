@@ -270,9 +270,10 @@ pub fn setFn(comptime handleFn: *const fn (Event) void) void {
             handleFn(event);
         }
         const vtable: VTable = .{ .handle = handle };
+        // Static storage for setFn — avoids dangling stack pointer.
+        var storage: u8 = 0;
     };
-    var dummy: u8 = 0;
-    global = .{ .ptr = &dummy, .vtable = &Gen.vtable };
+    global = .{ .ptr = &Gen.storage, .vtable = &Gen.vtable };
     // Same replay as set() — ensures early window_add not lost
     for (pending_window_add[0..pending_window_add_len]) |ref| {
         if (ref.get()) |win| if (win.state == .ready) {

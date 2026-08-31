@@ -60,7 +60,7 @@ const Tree = struct {
             if (ls < cs)
                 largest = win;
         }
-        n.root = .{ .leaf = largest.?};
+        n.root = .{ .leaf = largest.? };
         for (wins) |win| {
             if (n.root.? == .leaf and n.root.?.leaf == win)
                 continue;
@@ -144,7 +144,8 @@ pub const SimpleCompositor = struct {
     }
 
     fn onKeybindPressed(self: *SimpleCompositor, binding: *XkbBinding) void {
-        _ = self; _ = binding;
+        _ = self;
+        _ = binding;
         // Example: close focused window on Mod+Q (if you bound it)
         // if (binding.keysym == .q) { if (Nile.Seat.default().focused == .window) |w| Nile.Window.close(w); }
     }
@@ -196,7 +197,11 @@ pub const SimpleCompositor = struct {
         edges: Window.Edges,
         time_msec: u32,
     ) void {
-        _ = self; _ = x; _ = y; _ = time_msec; _ = button;
+        _ = self;
+        _ = x;
+        _ = y;
+        _ = time_msec;
+        _ = button;
         switch (state) {
             .pressed => switch (kind) {
                 .move => if (window) |win| {
@@ -227,7 +232,10 @@ pub const SimpleCompositor = struct {
     }
 
     fn onPointerMotion(self: *SimpleCompositor, seat: *@import("Seat.zig"), x: f64, y: f64, dx: f64, dy: f64, time_msec: u32) void {
-        _ = self; _ = dx; _ = dy; _ = time_msec;
+        _ = self;
+        _ = dx;
+        _ = dy;
+        _ = time_msec;
         if (seat.op) |op| if (op.window) |win| {
             switch (op.kind) {
                 .move => {
@@ -244,14 +252,20 @@ pub const SimpleCompositor = struct {
                     const delta_x = @as(i32, @intFromFloat(x)) - op.start_x;
                     const delta_y = @as(i32, @intFromFloat(y)) - op.start_y;
                     if (op.edges.right) new_w += delta_x;
-                    if (op.edges.left) { new_w -= delta_x; new_x += delta_x; }
+                    if (op.edges.left) {
+                        new_w -= delta_x;
+                        new_x += delta_x;
+                    }
                     if (op.edges.bottom) new_h += delta_y;
-                    if (op.edges.top) { new_h -= delta_y; new_y += delta_y; }
+                    if (op.edges.top) {
+                        new_h -= delta_y;
+                        new_y += delta_y;
+                    }
                     if (new_w < 20) new_w = 20;
                     if (new_h < 20) new_h = 20;
                     Nile.Window.setPosition(win, new_x, new_y);
                     Nile.Window.setDimensions(win, @intCast(new_w), @intCast(new_h));
-                    Nile.dirtyWindowing();
+                    Nile.dirtyWindowingLazy();
                     Nile.dirtyRendering();
                 },
                 .normal => {},
