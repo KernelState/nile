@@ -667,8 +667,6 @@ pub const NileCompositor = struct {
         delta_y: f64,
         time_msec: u32,
     ) void {
-        _ = delta_x;
-        _ = delta_y;
         _ = time_msec;
         if (seat.op) |op| if (op.window) |ref| if (ref.get()) |win| {
             switch (op.kind) {
@@ -739,9 +737,10 @@ pub const NileCompositor = struct {
                     if (has_h) {
                         const b = horiz_branch orelse return;
                         const pb = horiz_box orelse b.getBox();
-                        const desired = (x - @as(f64, @floatFromInt(pb.x))) / @as(f64, @floatFromInt(pb.w));
-                        if (desired < 0 or desired > 1) return;
-                        b.branch.setRatioFromCursor(x, pb.x, pb.w);
+                        if (pb.w != 0) {
+                            b.branch.ratio += delta_x / @as(f64, @floatFromInt(pb.w));
+                            b.branch.ratio = @max(0.05, @min(0.95, b.branch.ratio));
+                        }
                         resized = true;
                     }
                     if (has_v) {
@@ -755,9 +754,10 @@ pub const NileCompositor = struct {
                             return;
                         };
                         const pb = vert_box orelse b.getBox();
-                        const desired = (y - @as(f64, @floatFromInt(pb.y))) / @as(f64, @floatFromInt(pb.h));
-                        if (desired < 0 or desired > 1) return;
-                        b.branch.setRatioFromCursor(y, pb.y, pb.h);
+                        if (pb.h != 0) {
+                            b.branch.ratio += delta_y / @as(f64, @floatFromInt(pb.h));
+                            b.branch.ratio = @max(0.05, @min(0.95, b.branch.ratio));
+                        }
                         resized = true;
                     }
                     if (!resized) return;

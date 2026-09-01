@@ -509,6 +509,15 @@ fn windowAtCursor(cursor: *Cursor) ?*Window {
     return null;
 }
 
+fn modHeld(cursor: *Cursor) bool {
+    const wlr_keyboard = cursor.seat.wlr_seat.getKeyboard() orelse return false;
+    const mods = wlr_keyboard.getModifiers();
+    // Adaptive: if WAYLAND_DISPLAY was set at startup we are nested → use Alt,
+    // otherwise we are the main compositor → use Super (logo).
+    const is_nested = std.c.getenv("WAYLAND_DISPLAY") != null;
+    if (is_nested) return mods.alt else return mods.logo;
+}
+
 pub fn processButton(cursor: *Cursor, event: *const Seat.Event.PointerButton) void {
     if (event.state == .pressed) {
         const result = cursor.pressed.getOrPut(util.gpa, event.button) catch {
@@ -518,6 +527,65 @@ pub fn processButton(cursor: *Cursor, event: *const Seat.Event.PointerButton) vo
         if (result.found_existing) {
             log.err("ignoring duplicate pointer button {d} press", .{event.button});
             return;
+        }
+
+        // Adaptive mod-drag: Super when running as main compositor,
+        // Alt when nested (WAYLAND_DISPLAY already set → parent compositor).
+        if (cursor.modHeld()) {
+            if (cursor.windowAtCursor()) |win| {
+                if (event.button == 272 and cursor.seat.op == null) {
+                    const win_w: u31 = @intCast(@max(0, win.box.width));
+                    const win_h: u31 = @intCast(@max(0, win.box.height));
+                    cursor.seat.op = .{
+                        .input = .pointer,
+                        .start_x = @intFromFloat(cursor.wlr_cursor.x),
+                        .start_y = @intFromFloat(cursor.wlr_cursor.y),
+                        .x = @intFromFloat(cursor.wlr_cursor.x),
+                        .y = @intFromFloat(cursor.wlr_cursor.y),
+                        .kind = .move,
+                        .edges = .{},
+                        .window = win.ref,
+                        .win_x = win.box.x,
+                        .win_y = win.box.y,
+                        .win_width = win_w,
+                        .win_height = win_h,
+                    };
+                    cursor.seat.wm_requested.op = .{ .start_pointer = .{ .kind = .move, .edges = .{}, .window = win.ref } };
+                    server.wm.dirtyWindowing();
+                    cursor.opStartPointer();
+                    cursor.emitPointerButton(event, .move, .{}, win);
+                    result.value_ptr.* = null;
+                    return;
+                } else if (event.button == 273 and cursor.seat.op == null) {
+                    var edges: Window.Edges = .{};
+                    const cx: f64 = @as(f64, @floatFromInt(win.box.x)) + @as(f64, @floatFromInt(win.box.width)) / 2.0;
+                    const cy: f64 = @as(f64, @floatFromInt(win.box.y)) + @as(f64, @floatFromInt(win.box.height)) / 2.0;
+                    if (cursor.wlr_cursor.x < cx) edges.left = true else edges.right = true;
+                    if (cursor.wlr_cursor.y < cy) edges.top = true else edges.bottom = true;
+                    const win_w: u31 = @intCast(@max(0, win.box.width));
+                    const win_h: u31 = @intCast(@max(0, win.box.height));
+                    cursor.seat.op = .{
+                        .input = .pointer,
+                        .start_x = @intFromFloat(cursor.wlr_cursor.x),
+                        .start_y = @intFromFloat(cursor.wlr_cursor.y),
+                        .x = @intFromFloat(cursor.wlr_cursor.x),
+                        .y = @intFromFloat(cursor.wlr_cursor.y),
+                        .kind = .resize,
+                        .edges = edges,
+                        .window = win.ref,
+                        .win_x = win.box.x,
+                        .win_y = win.box.y,
+                        .win_width = win_w,
+                        .win_height = win_h,
+                    };
+                    cursor.seat.wm_requested.op = .{ .start_pointer = .{ .kind = .resize, .edges = edges, .window = win.ref } };
+                    server.wm.dirtyWindowing();
+                    cursor.opStartPointer();
+                    cursor.emitPointerButton(event, .resize, edges, win);
+                    result.value_ptr.* = null;
+                    return;
+                }
+            }
         }
 
         if (cursor.seat.matchPointerBinding(event.button)) |binding| {
