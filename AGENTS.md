@@ -9,12 +9,13 @@
 ## Build / Run / Test
 ```bash
 zig build --help                          # all options
-zig build -Doptimize=ReleaseSafe --prefix ~/.local install
+zig build -Doptimize=ReleaseSafe --prefix ~/.local install  # add -Dllvm (preferred, avoids sframe R_X86_64_PC64 linker errors on some toolchains)
 zig build -Dxwayland                      # enable Xwayland (off by default, build_options.xwayland)
-zig build -Dstrip -Dpie -Dllvm            # other flags in build.zig:16
+zig build -Dstrip -Dpie -Dllvm            # other flags in build.zig:16; -Dllvm is preferred for all builds (default backend hits crt1.o:.sframe relocations)
 zig build test                            # only test: common/slotmap.zig (build.zig:211)
 zig build run                             # runs compositor — needs Wayland/KMS, not for CI
 ```
+- Always prefer `zig build -Dllvm` (or `zig build -Dllvm -Dxwayland …`) for local compilation; the default LLVM-free backend currently fails to link with `R_X86_64_PC64` in `crt1.o:.sframe` on newer binutils/glibc.
 - Typecheck is `zig build` itself (no separate `tsc`); there is no lint/formatter beyond `zig fmt`.
 - Single test suite; `zig build test` runs `common/slotmap.zig:124` (`basic` / `iteration` / `remove during iteration`). No integration tests.
 - Man pages: built via `scdoc < doc/nile.1.scd` if `scdoc` found; disable with `-Dman-pages=false` (`build.zig:29`).

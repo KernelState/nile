@@ -148,6 +148,12 @@ pub fn main(init: std.process.Init.Minimal) anyerror!void {
     try server.init(runtime_xwayland);
     defer server.deinit();
 
+    // NileBank IPC — socket id "compositor" → /run/arcos/compositor.sock
+    @import("Bank.zig").init() catch |err| {
+        log.err("bank: failed to start nilebank server: {}", .{err});
+    };
+    defer @import("Bank.zig").deinit();
+
     // Load animation config from XDG (e.g. ~/.config/nile/animations.json) if present.
     // Missing file keeps defaults; JSON is forward-compatible (unknown fields ignored).
     _ = @import("Animation.zig").loadGlobalFromXdg(util.gpa);
@@ -305,6 +311,8 @@ const LogScope = enum {
     xdg_popup,
     animation,
     xwayland,
+    bank,
+    protocol,
 };
 
 var log_scopes: std.EnumSet(LogScope) = std.EnumSet(LogScope).initFull();

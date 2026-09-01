@@ -140,6 +140,8 @@ pub fn build(b: *Build) !void {
     const flags = b.createModule(.{ .root_source_file = b.path("common/flags.zig") });
     const slotmap = b.createModule(.{ .root_source_file = b.path("common/slotmap.zig") });
 
+    const nilebank = b.dependency("nilebank", .{}).module("nilebank");
+
     const translate_c: Translator = .init(b.dependency("translate_c", .{}), .{
         .name = "c",
         .c_source_file = b.path("nile/c.h"),
@@ -178,6 +180,7 @@ pub fn build(b: *Build) !void {
         nile.root_module.addImport("flags", flags);
         nile.root_module.addImport("slotmap", slotmap);
         nile.root_module.addImport("c", translate_c.mod);
+        nile.root_module.addImport("nilebank", nilebank);
 
         nile.root_module.addCSourceFile(.{
             .file = b.path("nile/wlroots_log_wrapper.c"),
