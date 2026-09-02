@@ -393,7 +393,7 @@ pub const NileCompositor = struct {
     fn onWindowAdd(self: *NileCompositor, win: *Window) void {
         log.info("window add (ready): {?s}", .{win.getTitle()});
         const out = Nile.Output.primary() orelse return;
-        const box = Nile.Output.effectiveBox(out);
+        const box = Nile.Layer.nonExclusiveArea(out);
         if (self.root) |*r| {
             const drop_x: i32 = @intCast(@max(0, win.box.x));
             const drop_y: i32 = @intCast(@max(0, win.box.y));
@@ -402,8 +402,8 @@ pub const NileCompositor = struct {
                 log.debug("New node: {}", .{@intFromPtr(node)});
             }
             arrangeNode(.{
-                .x = 0,
-                .y = 0,
+                .x = @intCast(box.x),
+                .y = @intCast(box.y),
                 .w = @intCast(box.width),
                 .h = @intCast(box.height),
             }, &self.root.?, true);
@@ -434,15 +434,15 @@ pub const NileCompositor = struct {
         }
         if (self.root) |*r| {
             const out = Nile.Output.primary() orelse return;
-            const box = Nile.Output.effectiveBox(out);
+            const box = Nile.Layer.nonExclusiveArea(out);
             // Pointer identity: find node that owns `win`, no coordinates.
             const n = r.find(win) orelse return;
             const p = r.findParent(n) orelse return;
             const is_first = p.branch.first == n;
             p.pop(is_first);
             arrangeNode(.{
-                .x = 0,
-                .y = 0,
+                .x = @intCast(box.x),
+                .y = @intCast(box.y),
                 .w = @intCast(box.width),
                 .h = @intCast(box.height),
             }, r, true);
@@ -475,7 +475,7 @@ pub const NileCompositor = struct {
     /// Arrange all windows. Replaces the current root.
     pub fn arrange(self: *NileCompositor) void {
         const out = Nile.Output.primary() orelse return;
-        const box = Nile.Output.effectiveBox(out);
+        const box = Nile.Layer.nonExclusiveArea(out);
         if (box.width == 0 or box.height == 0) return;
         var wins = std.ArrayList(*Window).empty;
         var it = Nile.Window.iter();
@@ -489,8 +489,8 @@ pub const NileCompositor = struct {
         self.root = construct(self.gpa, wins.items);
         if (self.root) |*r| {
             arrangeNode(.{
-                .x = 0,
-                .y = 0,
+                .x = @intCast(box.x),
+                .y = @intCast(box.y),
                 .w = @intCast(box.width),
                 .h = @intCast(box.height),
             }, r, true);
@@ -624,7 +624,8 @@ pub const NileCompositor = struct {
                         const drop_x: i32 = @as(i32, @intFromFloat(@floor(x)));
                         const drop_y: i32 = @as(i32, @intFromFloat(@floor(y)));
                         const target = if (Nile.Output.primary()) |out| blk: {
-                            const output_box: Box = .{ .x = 0, .y = 0, .w = @intCast(Nile.Output.effectiveBox(out).width), .h = @intCast(Nile.Output.effectiveBox(out).height) };
+                            const nea = Nile.Layer.nonExclusiveArea(out);
+                            const output_box: Box = .{ .x = @intCast(nea.x), .y = @intCast(nea.y), .w = @intCast(nea.width), .h = @intCast(nea.height) };
                             break :blk r.getNodeAllocated(drop_x, drop_y, r, output_box);
                         } else r.getNode(drop_x, drop_y);
                         if (op_kind == .move) {
@@ -648,10 +649,10 @@ pub const NileCompositor = struct {
         }
         if (self.root) |*r| {
             const out = Nile.Output.primary() orelse return;
-            const box = Nile.Output.effectiveBox(out);
+            const box = Nile.Layer.nonExclusiveArea(out);
             arrangeNode(.{
-                .x = 0,
-                .y = 0,
+                .x = @intCast(box.x),
+                .y = @intCast(box.y),
                 .w = @intCast(box.width),
                 .h = @intCast(box.height),
             }, r, true);
@@ -687,12 +688,12 @@ pub const NileCompositor = struct {
                     const n = self.root.?.find(win) orelse return;
 
                     const out = Nile.Output.primary() orelse return;
-                    const effective = Nile.Output.effectiveBox(out);
+                    const nea = Nile.Layer.nonExclusiveArea(out);
                     const output_box: Box = .{
-                        .x = 0,
-                        .y = 0,
-                        .w = @intCast(effective.width),
-                        .h = @intCast(effective.height),
+                        .x = @intCast(nea.x),
+                        .y = @intCast(nea.y),
+                        .w = @intCast(nea.width),
+                        .h = @intCast(nea.height),
                     };
 
                     const has_h = op.edges.left or op.edges.right;

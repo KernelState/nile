@@ -154,7 +154,7 @@ pub const SimpleCompositor = struct {
     /// Replace with your tiling logic. Call whenever window/output set changes.
     pub fn arrange(self: *SimpleCompositor) void {
         const out = Nile.Output.primary() orelse return;
-        const box = Nile.Output.effectiveBox(out);
+        const box = Nile.Layer.nonExclusiveArea(out);
         if (box.width == 0 or box.height == 0) return;
         var wins = std.ArrayList(*Window).empty;
         var it = Nile.Window.iter();
