@@ -32,8 +32,8 @@
             .hash = "translate_c-0.0.0-Q_BUWlL1BgD7PmL27vTsccyNCOvKb-B65O5Ki1ZKm-ED",
         },
         .nilebank = .{
-            .url = "git+https://github.com/ArcOS-Official/nilebank",
-            .hash = "nilebank-0.0.0-xHtKtLKxAQDeKmtC5feBC8c-HvYCPvF2lo9h6eiak4b3",
+            .url = "git+https://github.com/ArcOS-Official/nilebank#5487e73dbc20498c2d7bc0301c7ea347c1963b40",
+            .hash = "nilebank-0.0.0-xHtKtPaxAQD2QfDyFK_ddWntnQ2gmWXiS2J78bwbxRjb",
         },
     },
     .fingerprint = 0xf5e3672b8e8d6efc,
