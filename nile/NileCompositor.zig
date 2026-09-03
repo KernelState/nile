@@ -11,6 +11,8 @@
 //! Control is via `Nile.*` calls inside `handle` — e.g. `Nile.Window.setPosition`.
 
 const std = @import("std");
+const server = &@import("main.zig").server;
+const xkb = @import("xkbcommon");
 const Nile = @import("Nile.zig");
 const Compositor = @import("Compositor.zig");
 const Window = @import("Window.zig");
@@ -361,15 +363,83 @@ pub fn construct(alloc: std.mem.Allocator, wins: []const *Window) ?Node {
 pub const NileCompositor = struct {
     arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator),
     gpa: std.mem.Allocator = undefined,
-    root: ?Node = null,
+    /// One tiling tree per workspace (index `id - 1`). Switching workspaces
+    /// only swaps which tree is laid out — trees are never rebuilt, so each
+    /// workspace keeps its splits/ratios across switches.
+    roots: [ws_count]?Node = [_]?Node{null} ** ws_count,
+
+    const ws_count: usize = @import("Workspace.zig").Manager.fixed_count;
+
+    /// Tree for the currently visible workspace.
+    fn cur(self: *NileCompositor) *?Node {
+        return self.rootFor(server.workspace.currentWorkspace());
+    }
+
+    /// Tree for workspace `id`. Unknown ids fall back to current.
+    fn rootFor(self: *NileCompositor, id: u64) *?Node {
+        if (id >= 1 and id - 1 < ws_count) return &self.roots[@intCast(id - 1)];
+        return &self.roots[curIdx()];
+    }
+
+    fn curIdx() usize {
+        const id = server.workspace.currentWorkspace();
+        if (id < 1 or id - 1 >= ws_count) return 0;
+        return @intCast(id - 1);
+    }
 
     pub fn init(self: *NileCompositor) void {
         log.info("initialized window manager", .{});
         self.gpa = self.arena.allocator();
+        self.registerWorkspaceBindings();
     }
 
     pub fn deinit(self: *NileCompositor) void {
         self.arena.deinit();
+    }
+
+    /// MOD + 1..9 switches to workspace <num>.
+    /// MOD is Alt when nested (Wayland/X11 backend) and Super/logo on
+    /// DRM/KMS — see `util.modMask`. All 9 workspaces are created at
+    /// startup and always exist — no on-demand creation here.
+    fn registerWorkspaceBindings(self: *NileCompositor) void {
+        _ = self;
+        const seat = Nile.Seat.default();
+        const mod = @import("util.zig").modMask();
+        const keys = [_]xkb.Keysym{
+            xkb.Keysym.@"1",
+            xkb.Keysym.@"2",
+            xkb.Keysym.@"3",
+            xkb.Keysym.@"4",
+            xkb.Keysym.@"5",
+            xkb.Keysym.@"6",
+            xkb.Keysym.@"7",
+            xkb.Keysym.@"8",
+            xkb.Keysym.@"9",
+        };
+        for (keys) |sym| {
+            const binding = Nile.Seat.addXkbBinding(seat, sym, mod) catch |err| {
+                log.warn("failed to register workspace binding: {}", .{err});
+                continue;
+            };
+            _ = binding;
+        }
+    }
+
+    /// Switch to the workspace with human number `num` (1..9).
+    /// The fixed set always exists — out-of-range numbers and missing
+    /// workspaces are ignored, never created. Layout of the restored tree
+    /// happens via the `workspace_switched` event (no rebuild).
+    fn switchToWorkspaceNumber(self: *NileCompositor, num: u64) void {
+        _ = self;
+        if (num < 1 or num > @import("Workspace.zig").Manager.fixed_count) return;
+        const id = server.workspace.idForNumber(num) orelse {
+            log.warn("workspace {d} does not exist", .{num});
+            return;
+        };
+        _ = server.workspace.switchWorkspace(id) catch |err| {
+            log.warn("failed to switch workspace {d}: {}", .{ num, err });
+            return;
+        };
     }
 
     pub fn handle(self: *NileCompositor, event: Compositor.Event) void {
@@ -383,6 +453,8 @@ pub const NileCompositor = struct {
             .output_update => |out| self.onOutputUpdate(out),
             .keybind_pressed => |binding| self.onKeybindPressed(binding),
             .window_fullscreen_request => |req| self.onFullscreen(req.window, req.output),
+            .workspace_switched => |v| self.onWorkspaceSwitched(v.old_id, v.new_id),
+            .window_workspace_changed => |v| self.onWindowWorkspaceChanged(v.window, v.old_id, v.new_id),
             .pointer_motion => |ev| self.onPointerMotion(ev.seat, ev.x, ev.y, ev.dx, ev.dy, ev.time_msec),
             .pointer_button => |ev| self.onPointerButton(ev.seat, ev.window, ev.button, ev.state, ev.x, ev.y, ev.kind, ev.edges, ev.time_msec),
             .frame => self.onFrame(),
@@ -392,28 +464,30 @@ pub const NileCompositor = struct {
 
     fn onWindowAdd(self: *NileCompositor, win: *Window) void {
         log.info("window add (ready): {?s}", .{win.getTitle()});
-        const out = Nile.Output.primary() orelse return;
-        const box = Nile.Layer.nonExclusiveArea(out);
-        if (self.root) |*r| {
+        // New windows open on the current workspace (they default to id 1).
+        const current_ws = server.workspace.currentWorkspace();
+        win.wm_requested.workspace = current_ws;
+        if (self.cur().*) |*r| {
             const drop_x: i32 = @intCast(@max(0, win.box.x));
             const drop_y: i32 = @intCast(@max(0, win.box.y));
             r.append(self.gpa, win, drop_x, drop_y);
             if (r.find(win)) |node| {
                 log.debug("New node: {}", .{@intFromPtr(node)});
             }
-            arrangeNode(.{
-                .x = @intCast(box.x),
-                .y = @intCast(box.y),
-                .w = @intCast(box.width),
-                .h = @intCast(box.height),
-            }, &self.root.?, true);
+            self.layoutTree(r);
         } else {
-            log.debug("Rebuilding root", .{});
-            self.arrange();
+            log.debug("First window on workspace, creating root", .{});
+            self.cur().* = .{ .leaf = win };
+            self.layoutCurrent();
         }
     }
 
     fn onWindowMap(self: *NileCompositor, win: *Window) void {
+        const current_ws = server.workspace.currentWorkspace();
+        if (win.wm_requested.workspace != current_ws) {
+            win.rendering_requested.hidden = true;
+            return;
+        }
         _ = self;
         Nile.Window.focus(win);
     }
@@ -424,28 +498,23 @@ pub const NileCompositor = struct {
     }
 
     fn onWindowDestroy(self: *NileCompositor, win: *Window) void {
-        const root = self.root orelse return;
-        if (root == .leaf) {
-            if (root.leaf == win) {
-                self.root = null;
-                log.debug("Root deleted", .{});
+        // The window knows its workspace; detach it from that tree so the
+        // other workspaces' tilings are untouched.
+        const root = self.rootFor(win.wm_requested.workspace);
+        if (root.*) |*r| {
+            if (r.* == .leaf) {
+                if (r.leaf == win) {
+                    root.* = null;
+                    log.debug("Root deleted", .{});
+                }
+                return;
             }
-            return;
-        }
-        if (self.root) |*r| {
-            const out = Nile.Output.primary() orelse return;
-            const box = Nile.Layer.nonExclusiveArea(out);
             // Pointer identity: find node that owns `win`, no coordinates.
             const n = r.find(win) orelse return;
             const p = r.findParent(n) orelse return;
             const is_first = p.branch.first == n;
             p.pop(is_first);
-            arrangeNode(.{
-                .x = @intCast(box.x),
-                .y = @intCast(box.y),
-                .w = @intCast(box.width),
-                .h = @intCast(box.height),
-            }, r, true);
+            if (root == self.cur()) self.layoutTree(r);
         }
     }
 
@@ -466,35 +535,112 @@ pub const NileCompositor = struct {
     }
 
     fn onKeybindPressed(self: *NileCompositor, binding: *XkbBinding) void {
-        _ = self;
-        _ = binding;
-        // Example: close focused window on Mod+Q (if you bound it)
-        // if (binding.keysym == .q) { if (Nile.Seat.default().focused == .window) |w| Nile.Window.close(w); }
+        const num: u64 = switch (binding.keysym) {
+            xkb.Keysym.@"1" => 1,
+            xkb.Keysym.@"2" => 2,
+            xkb.Keysym.@"3" => 3,
+            xkb.Keysym.@"4" => 4,
+            xkb.Keysym.@"5" => 5,
+            xkb.Keysym.@"6" => 6,
+            xkb.Keysym.@"7" => 7,
+            xkb.Keysym.@"8" => 8,
+            xkb.Keysym.@"9" => 9,
+            // MOD+0 is unbound — Nile has exactly 9 workspaces.
+            else => return,
+        };
+        log.info("workspace keybinding: switch to {d}", .{num});
+        self.switchToWorkspaceNumber(num);
     }
 
-    /// Arrange all windows. Replaces the current root.
+    /// A workspace became visible. Its tree is restored as-is — apply its
+    /// saved geometry without rebuilding, so switching never retiles.
+    fn onWorkspaceSwitched(self: *NileCompositor, old_id: u64, new_id: u64) void {
+        _ = old_id;
+        _ = new_id;
+        self.layoutCurrent();
+    }
+
+    /// A window moved between workspaces. Detach it from the old tree and
+    /// attach it to the new one; both tilings otherwise untouched.
+    fn onWindowWorkspaceChanged(self: *NileCompositor, win: *Window, old_id: u64, new_id: u64) void {
+        const old_root = self.rootFor(old_id);
+        if (old_root.*) |*r| {
+            if (r.find(win)) |n| {
+                if (r.* == .leaf) {
+                    old_root.* = null;
+                } else if (r.findParent(n)) |p| {
+                    p.pop(p.branch.first == n);
+                }
+            }
+            if (old_root == self.cur()) {
+                if (old_root.*) |*rr| self.layoutTree(rr);
+            }
+        }
+        const new_root = self.rootFor(new_id);
+        if (new_root.*) |*r| {
+            const drop_x: i32 = @intCast(@max(0, win.box.x));
+            const drop_y: i32 = @intCast(@max(0, win.box.y));
+            r.append(self.gpa, win, drop_x, drop_y);
+            if (new_root == self.cur()) self.layoutTree(r);
+        } else {
+            new_root.* = .{ .leaf = win };
+            if (new_root == self.cur()) self.layoutCurrent();
+        }
+    }
+
+    /// Arrange all windows. Only builds a tree when the current workspace has
+    /// none yet (first show); otherwise lays out the existing tree so manual
+    /// splits/ratios survive.
     pub fn arrange(self: *NileCompositor) void {
+        self.ensureCurrentTree();
+        self.layoutCurrent();
+    }
+
+    /// Attach any current-workspace windows missing from its tree (e.g. first
+    /// show, or windows assigned while this policy wasn't registered).
+    /// Existing splits/ratios are preserved — nothing is ever rebuilt here.
+    fn ensureCurrentTree(self: *NileCompositor) void {
+        const current_ws = server.workspace.currentWorkspace();
+        const root = self.cur();
+        if (root.* == null) {
+            var wins = std.ArrayList(*Window).empty;
+            defer wins.deinit(self.gpa);
+            var it = Nile.Window.iter();
+            while (it.next()) |win| {
+                if (win.wm_requested.workspace != current_ws) continue;
+                wins.append(self.gpa, win) catch unreachable;
+            }
+            if (wins.items.len == 0) return;
+            root.* = construct(self.gpa, wins.items);
+            return;
+        }
+        var it = Nile.Window.iter();
+        while (it.next()) |win| {
+            if (win.wm_requested.workspace != current_ws) continue;
+            const r: *Node = &root.*.?;
+            if (r.find(win) != null) continue;
+            const drop_x: i32 = @intCast(@max(0, win.box.x));
+            const drop_y: i32 = @intCast(@max(0, win.box.y));
+            r.append(self.gpa, win, drop_x, drop_y);
+        }
+    }
+
+    /// Apply the current workspace tree's geometry to its windows.
+    fn layoutCurrent(self: *NileCompositor) void {
+        if (self.cur().*) |*r| self.layoutTree(r);
+    }
+
+    /// Apply one tree's geometry. Pure layout — never mutates the tree.
+    fn layoutTree(_: *NileCompositor, r: *Node) void {
         const out = Nile.Output.primary() orelse return;
         const box = Nile.Layer.nonExclusiveArea(out);
         if (box.width == 0 or box.height == 0) return;
-        var wins = std.ArrayList(*Window).empty;
-        var it = Nile.Window.iter();
-        while (it.next()) |win| {
-            wins.append(self.gpa, win) catch unreachable;
-        }
-        if (wins.items.len == 0) {
-            self.root = null;
-            return;
-        }
-        self.root = construct(self.gpa, wins.items);
-        if (self.root) |*r| {
-            arrangeNode(.{
-                .x = @intCast(box.x),
-                .y = @intCast(box.y),
-                .w = @intCast(box.width),
-                .h = @intCast(box.height),
-            }, r, true);
-        }
+        arrangeNode(.{
+            .x = @intCast(box.x),
+            .y = @intCast(box.y),
+            .w = @intCast(box.width),
+            .h = @intCast(box.height),
+        }, r, true);
         Nile.dirtyWindowing();
         Nile.dirtyRendering();
     }
@@ -574,11 +720,12 @@ pub const NileCompositor = struct {
                     log.info("pointer_button move pressed on {?s}", .{win.getTitle()});
                     Nile.Seat.focusWindow(seat, win);
                     Nile.Window.raiseToTop(win);
-                    if (self.root == null or self.root.? == .leaf)
+                    const cur_root = self.cur();
+                    if (cur_root.* == null or cur_root.*.? == .leaf)
                         return;
                     Nile.Seat.opStartMove(seat, win);
-                    const n = self.root.?.find(win) orelse return;
-                    const p = self.root.?.findParent(n) orelse return;
+                    const n = cur_root.*.?.find(win) orelse return;
+                    const p = cur_root.*.?.findParent(n) orelse return;
                     p.pop(p.branch.first == n);
                 },
                 .resize => if (window) |win| {
@@ -619,8 +766,9 @@ pub const NileCompositor = struct {
                 if (op_win) |win| {
                     if (op_kind == .resize) Nile.Window.setResizing(win, false);
                     log.info("pointer_button {s} released at {d:.0},{d:.0}", .{ @tagName(op_kind), x, y });
-                    log.info("Nullability of root {}", .{(self.root == null)});
-                    if (self.root) |*r| {
+                    const cur_root = self.cur();
+                    log.info("Nullability of root {}", .{(cur_root.* == null)});
+                    if (cur_root.*) |*r| {
                         const drop_x: i32 = @as(i32, @intFromFloat(@floor(x)));
                         const drop_y: i32 = @as(i32, @intFromFloat(@floor(y)));
                         const target = if (Nile.Output.primary()) |out| blk: {
@@ -640,14 +788,14 @@ pub const NileCompositor = struct {
                         });
                     } else {
                         log.info("set moving window as root", .{});
-                        self.root = .{ .leaf = win };
+                        cur_root.* = .{ .leaf = win };
                     }
                 }
                 if (seat.op != null or op_info != null) Nile.Seat.opEnd(seat);
             },
             else => {},
         }
-        if (self.root) |*r| {
+        if (self.cur().*) |*r| {
             const out = Nile.Output.primary() orelse return;
             const box = Nile.Layer.nonExclusiveArea(out);
             arrangeNode(.{
@@ -685,7 +833,8 @@ pub const NileCompositor = struct {
                     }
                 },
                 .resize => {
-                    const n = self.root.?.find(win) orelse return;
+                    const rnode: *Node = if (self.cur().*) |*r| r else return;
+                    const n = rnode.find(win) orelse return;
 
                     const out = Nile.Output.primary() orelse return;
                     const nea = Nile.Layer.nonExclusiveArea(out);
@@ -712,12 +861,12 @@ pub const NileCompositor = struct {
                     var horiz_box: ?Box = null;
                     var vert_box: ?Box = null;
 
-                    var cur: ?*Node = n;
-                    while (cur) |node| {
-                        const parent = self.root.?.findParent(node) orelse break;
-                        const pb = self.root.?.allocatedBoxFor(parent, output_box) orelse parent.getBox();
+                    var anc: ?*Node = n;
+                    while (anc) |node| {
+                        const parent = rnode.findParent(node) orelse break;
+                        const pb = rnode.allocatedBoxFor(parent, output_box) orelse parent.getBox();
                         if (pb.w == 0 or pb.h == 0) {
-                            cur = parent;
+                            anc = parent;
                             continue;
                         }
                         if (horiz_branch == null and has_h and parent.branch.orientation == .horizontal) {
@@ -731,7 +880,7 @@ pub const NileCompositor = struct {
                         if (has_h and !has_v and horiz_branch != null) break;
                         if (!has_h and has_v and vert_branch != null) break;
                         if (has_h and has_v and horiz_branch != null and vert_branch != null) break;
-                        cur = parent;
+                        anc = parent;
                     }
 
                     var resized = false;
@@ -749,7 +898,7 @@ pub const NileCompositor = struct {
                             if (!resized) return;
                             // diagonal edge where one axis already resized
                             // but other axis has no matching branch — keep horiz resize
-                            arrangeNode(output_box, &self.root.?, false);
+                            arrangeNode(output_box, rnode, false);
                             Nile.dirtyWindowingLazy();
                             Nile.dirtyRenderingImmediate();
                             return;
@@ -767,7 +916,7 @@ pub const NileCompositor = struct {
                     // During drag, animate=false to avoid lag — batch visual updates
                     // and keep grabbed window immediate. After drop, final arrange
                     // will animate=true.
-                    arrangeNode(output_box, &self.root.?, false);
+                    arrangeNode(output_box, rnode, false);
                     // Exception for motion: windowing (dimensions/configure) is still
                     // lazy/idle so it doesn't block motion coalescing, but rendering
                     // (position) is flushed synchronously on every motion for

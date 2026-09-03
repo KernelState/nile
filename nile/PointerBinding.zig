@@ -5,8 +5,6 @@
 
 const PointerBinding = @This();
 
-const std = @import("std");
-const assert = std.debug.assert;
 const wlr = @import("wlroots");
 const wl = @import("wayland").server.wl;
 
@@ -64,16 +62,18 @@ pub fn destroy(binding: *PointerBinding) void {
 }
 
 pub fn pressed(binding: *PointerBinding) void {
-    assert(!binding.sent_pressed);
-    assert(binding.wm_scheduled.state_change == .none);
-    binding.wm_scheduled.state_change = .pressed;
+    // Nile: in-process compositor, no external WM client to ack.
+    // Idempotent: ignore repeat presses while held.
+    if (binding.sent_pressed) return;
+    binding.sent_pressed = true;
+    binding.wm_scheduled.state_change = .none;
     server.wm.dirtyWindowing();
 }
 
 pub fn released(binding: *PointerBinding) void {
-    assert(binding.sent_pressed);
-    assert(binding.wm_scheduled.state_change == .none);
-    binding.wm_scheduled.state_change = .released;
+    if (!binding.sent_pressed) return;
+    binding.sent_pressed = false;
+    binding.wm_scheduled.state_change = .none;
     server.wm.dirtyWindowing();
 }
 

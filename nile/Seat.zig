@@ -30,6 +30,7 @@ const PointerConstraint = @import("PointerConstraint.zig");
 const ShellSurface = @import("ShellSurface.zig");
 const Tablet = @import("Tablet.zig");
 const Window = @import("Window.zig");
+const Compositor = @import("Compositor.zig");
 const XkbBinding = @import("XkbBinding.zig");
 const XkbBindingsSeat = @import("XkbBindingsSeat.zig");
 const XwaylandOverrideRedirect = @import("XwaylandOverrideRedirect.zig");
@@ -619,7 +620,19 @@ pub fn focus(seat: *Seat, new_focus: Focus) void {
         .lock_surface => assert(server.lock_manager.state != .unlocked),
         .override_redirect, .none => {},
     }
+    const old_win: ?*Window = switch (seat.focused) {
+        .window => |w| w,
+        else => null,
+    };
+    const new_win: ?*Window = switch (target) {
+        .window => |w| w,
+        else => null,
+    };
     seat.focused = target;
+    // Tell policy + shell observers (via broadcast hook) which window gained/lost focus.
+    if (old_win != new_win) {
+        Compositor.notify(.{ .window_focus_changed = .{ .seat = seat, .old = old_win, .new = new_win } });
+    }
 
     if (seat.cursor.constraint) |constraint| {
         if (constraint.wlr_constraint.surface != target_surface) {

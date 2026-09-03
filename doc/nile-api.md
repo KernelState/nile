@@ -35,6 +35,7 @@ river/Seat.zig          — seat/focus/cursor (Nile.Seat)
 river/InputDevice.zig   — input devices (Nile.Input)
 river/XkbBinding.zig    — key bindings (Nile.Seat.addXkbBinding)
 river/LayerShell*.zig   — layer shell (Nile.Layer)
+river/Workspace.zig     — workspace management (Nile.Workspace)
 ```
 
 Standard Wayland / wlroots protocols (`xdg_shell`, `wlr_layer_shell`, `ext_session_lock`, etc.) are **unchanged**. Only the six `river_*` protocols have been removed.
@@ -196,6 +197,64 @@ pub fn setDefaultOutput(output: *Output) void
 pub fn nonExclusiveArea(output: *Output) wlr.Box
 ```
 
+### `Nile.Workspace`
+
+```zig
+pub fn currentWorkspace() u64               // returns current workspace id
+pub fn switchWorkspace(id: u64) !u64        // switch to workspace, returns new id
+pub fn addWorkspace(number: u64, name: []const u8) !u64  // add workspace, returns id
+pub fn removeWorkspace(id: u64) !void       // remove workspace by id
+pub fn setWorkspaceName(id: u64, name: []const u8) !void // rename workspace
+pub fn listWorkspaces(alloc: Allocator) ![]Workspace.Info // list all workspaces
+pub fn getWorkspace(id: u64, alloc: Allocator) ?Workspace.Info // get workspace info
+```
+
+**Example: switch to workspace 2**
+
+```zig
+const Nile = @import("Nile.zig");
+
+pub fn switchToSecond() void {
+    // Get workspace with number 2
+    var ws_id: u64 = 2;
+    _ = Nile.Workspace.switchWorkspace(ws_id);
+}
+```
+
+### Default keybindings
+
+The default compositor (`NileCompositor`) registers `MOD + 1..9` on the
+default seat to switch between the 9 fixed workspaces (created at startup,
+always present). MOD is Alt when nested (Wayland/X11 backend, so the outer
+compositor keeps Super) and Super/Logo on DRM/KMS. The same rule applies to
+mod-drag (move/resize). New windows open on the current workspace, and
+switching re-tiles for the newly visible set.
+
+### Shell event stream (`/tmp/arcos/compositor-events.sock`)
+
+The request/response socket (`/tmp/arcos/compositor.sock`) can only answer queries.
+Shells that need live state connect to the push socket instead:
+
+- Framing per message is `[kind: u8][encoding: u8][length: u16 BE][payload]`
+  (the same `Header` layout nilebank uses). Decode `payload` with
+  `protocols.compositor.Event.decodeAllocWith(alloc, kind, payload, encoding)`.
+- On connect the server immediately sends `windows_snapshot`, `workspaces_snapshot`,
+  then `outputs_snapshot`, so a new client learns the exact current state and catches up.
+- Afterwards one message is pushed per state change: `new_window`, `window_closed`,
+  `window_focused`, `window_title_changed`, `window_app_id_changed`,
+  `window_state_changed`, `window_workspace_changed`, `output_added`,
+  `output_removed`, `output_changed`, `workspace_created`, `workspace_removed`,
+  `workspace_activated`, `workspace_deactivated`, `switch_workspace`
+  (renames arrive as a full `workspaces_snapshot`). Pointer motion/buttons, frame
+  ticks and keybinds are intentionally not pushed — re-query (`list_windows`, …) for those.
+
+Sockets are nonblocking and owned by the main Wayland thread; a client that cannot
+keep up is disconnected and should reconnect (it will get fresh snapshots).
+`subscribe`/`unsubscribe` on the request socket are currently acknowledged no-ops —
+the event stream is the subscription mechanism. `switch_workspace` and
+`set_workspace_name` requests are applied asynchronously on the main thread (acked
+with `pong`); the outcome arrives on the event stream.
+
 ---
 
 ## Migration from protocols
@@ -213,6 +272,7 @@ pub fn nonExclusiveArea(output: *Output) wlr.Box
 | `river_input_manager_v1.create_seat` | `Nile.Seat.create("name")` |
 | `river_input_device_v1.assign_to_seat` | `Nile.Input.assignToSeat(dev, "name")` |
 | `river_layer_shell_output_v1.set_default` | `Nile.Layer.setDefaultOutput(out)` |
+| Workspace management (no protocol) | `Nile.Workspace.switchWorkspace(id)` |
 
 **Before (Wayland client):**
 

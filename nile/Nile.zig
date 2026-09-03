@@ -55,7 +55,8 @@ const wl = @import("wayland").server.wl;
 const xkb = @import("xkbcommon");
 
 const server = &@import("main.zig").server;
-
+const util = @import("util.zig");
+const Workspace = @import("Workspace.zig");
 const WindowMod = @import("Window.zig");
 const OutputMod = @import("Output.zig");
 const SeatMod = @import("Seat.zig");
@@ -720,6 +721,51 @@ pub const Layer = struct {
     /// Get non-exclusive area for an output (area left after exclusive zones).
     pub fn nonExclusiveArea(output: *OutputMod) wlr.Box {
         return output.layer_shell.scheduled.non_exclusive_area;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Workspace API — replaces `river_workspace_v1`
+// ---------------------------------------------------------------------------
+
+pub const WorkspaceApi = struct {
+    /// Workspace info returned by listWorkspaces and getWorkspace.
+    pub const Info = Workspace.Info;
+
+    /// Switch to the workspace with the given id.
+    pub fn switchWorkspace(id: u64) !u64 {
+        return server.workspace.switchWorkspace(id);
+    }
+
+    /// Return the id of the current workspace.
+    pub fn currentWorkspace() u64 {
+        return server.workspace.currentWorkspace();
+    }
+
+    /// Create a new workspace with the given number and name.
+    pub fn addWorkspace(number: u64, name: []const u8) !u64 {
+        _ = try server.workspace.addWorkspace(util.gpa, number, name);
+        return number;
+    }
+
+    /// Remove a workspace by id.
+    pub fn removeWorkspace(id: u64) !void {
+        try server.workspace.removeWorkspace(util.gpa, id);
+    }
+
+    /// Rename a workspace. The name is duplicated; the caller keeps its slice.
+    pub fn setWorkspaceName(id: u64, name: []const u8) !void {
+        try server.workspace.setWorkspaceName(util.gpa, id, name);
+    }
+
+    /// List all workspaces.
+    pub fn listWorkspaces() ![]Info {
+        return server.workspace.listWorkspaces(util.gpa);
+    }
+
+    /// Move a window to a different workspace.
+    pub fn moveWindowToWorkspace(window: *WindowMod, id: u64) !void {
+        try server.workspace.moveWindowToWorkspace(window, id);
     }
 };
 

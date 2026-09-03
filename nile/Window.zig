@@ -104,6 +104,7 @@ const WmRequested = struct {
     fullscreen: ?*Output,
     inform_fullscreen: bool,
     close: bool,
+    workspace: u64 = 1,
 
     pub const init: WmRequested = .{
         .dimensions = null,
@@ -121,6 +122,7 @@ const WmRequested = struct {
         .fullscreen = null,
         .inform_fullscreen = false,
         .close = false,
+        .workspace = 1,
     };
 };
 

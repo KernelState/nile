@@ -160,6 +160,38 @@ pub const Event = union(enum) {
     /// Frame / idle tick — opportunity to run deferred arrange logic.
     /// Emitted when `WindowManager` goes idle and no other event is pending.
     frame: void,
+
+    /// Keyboard focus changed on `seat`. Either side may be null (no window
+    /// focused). Emitted from `Seat.focus` after `seat.focused` is updated.
+    window_focus_changed: struct {
+        seat: *Seat,
+        old: ?*Window,
+        new: ?*Window,
+    },
+
+    /// Window moved between workspaces. Emitted from
+    /// `Workspace.Manager.moveWindowToWorkspace` after the assignment changes.
+    window_workspace_changed: struct {
+        window: *Window,
+        old_id: u64,
+        new_id: u64,
+    },
+
+    /// Current workspace changed. Emitted from `Workspace.Manager.switchWorkspace`
+    /// after `current` is updated and window visibility has been adjusted.
+    workspace_switched: struct {
+        old_id: u64,
+        new_id: u64,
+    },
+
+    /// A workspace was created (`Workspace.Manager.addWorkspace`). Payload is the id.
+    workspace_created: u64,
+
+    /// A workspace was removed (`Workspace.Manager.removeWorkspace`). Payload is the id.
+    workspace_removed: u64,
+
+    /// A workspace was renamed (`Workspace.Manager.setWorkspaceName`). Payload is the id.
+    workspace_renamed: u64,
 };
 
 pub const VTable = struct {
@@ -182,6 +214,17 @@ pub const Compositor = struct {
 
 // Global compositor instance. Null before `set` is called — events are dropped.
 var global: ?Compositor = null;
+
+/// Optional broadcast hook invoked from `notify` for every event, after the
+/// registered compositor (if any) has handled it. Used by `Bank.zig` to push
+/// state changes to shell clients over the event stream socket. Runs on the
+/// main Wayland thread. Set once during startup; prefer `setBroadcastHook`.
+pub var broadcast_hook: ?*const fn (event: Event) void = null;
+
+/// Register the broadcast hook (see `broadcast_hook`). Replaces any previous hook.
+pub fn setBroadcastHook(hook: *const fn (event: Event) void) void {
+    broadcast_hook = hook;
+}
 
 // Queue for window_add events that arrived before a compositor was
 // registered. Stores Refs (SlotMap keys) not raw pointers, so destroyed
@@ -222,6 +265,9 @@ pub fn get() ?Compositor {
 
 /// Deliver an event to the registered compositor if any. Safe to call when
 /// no compositor is set — no-op (window_add is queued for replay).
+/// Afterwards the broadcast hook (if set) receives the same event so
+/// out-of-process observers (e.g. the shell event stream) stay in sync
+/// even when no compositor policy is registered.
 pub fn notify(event: Event) void {
     if (global) |c| {
         c.handle(event);
@@ -236,6 +282,7 @@ pub fn notify(event: Event) void {
             }
         }
     }
+    if (broadcast_hook) |hook| hook(event);
 }
 
 /// Helper to create a `Compositor` from any struct that has

@@ -34,6 +34,7 @@ const XdgDecoration = @import("XdgDecoration.zig");
 const XdgToplevel = @import("XdgToplevel.zig");
 const XwaylandOverrideRedirect = @import("XwaylandOverrideRedirect.zig");
 const XwaylandWindow = @import("XwaylandWindow.zig");
+const Workspace = @import("Workspace.zig");
 
 const log = std.log;
 
@@ -99,8 +100,9 @@ om: OutputManager,
 idle_inhibit_manager: IdleInhibitManager,
 lock_manager: LockManager,
 wm: WindowManager,
-xkb_bindings: XkbBindings,
-layer_shell: LayerShell,
+    xkb_bindings: XkbBindings,
+    layer_shell: LayerShell,
+    workspace: Workspace.Manager,
 
 xwayland: if (build_options.xwayland) ?*wlr.Xwayland else void = if (build_options.xwayland) null,
 new_xsurface: if (build_options.xwayland) wl.Listener(*wlr.XwaylandSurface) else void =
@@ -234,6 +236,7 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
         .wm = undefined,
         .xkb_bindings = undefined,
         .layer_shell = undefined,
+        .workspace = undefined,
     };
 
     if (renderer.getTextureFormats(@intFromEnum(wlr.BufferCap.dmabuf)) != null) {
@@ -271,6 +274,7 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
     try server.wm.init();
     try server.xkb_bindings.init();
     try server.layer_shell.init();
+    try server.workspace.init(util.gpa);
     try server.scene.init();
     try server.om.init();
     try server.input_manager.init();
@@ -330,6 +334,7 @@ pub fn deinit(server: *Server) void {
     server.idle_inhibit_manager.deinit();
     server.lock_manager.deinit();
     server.layer_shell.deinit();
+    server.workspace.deinit(util.gpa);
 
     server.wl_server.destroy();
 }

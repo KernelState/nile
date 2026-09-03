@@ -6,8 +6,6 @@
 
 const XkbBinding = @This();
 
-const std = @import("std");
-const assert = std.debug.assert;
 const wlr = @import("wlroots");
 const xkb = @import("xkbcommon");
 const wl = @import("wayland").server.wl;
@@ -74,25 +72,29 @@ pub fn destroy(binding: *XkbBinding) void {
 }
 
 pub fn pressed(binding: *XkbBinding) void {
-    assert(!binding.sent_pressed);
-    assert(binding.wm_scheduled.state_change == .none);
-    binding.wm_scheduled.state_change = .pressed;
+    // Nile: in-process compositor — `notify` is delivered synchronously,
+    // there is no external WM client to ack a press. Track it locally.
+    // Idempotent: auto-repeat presses while held are ignored.
+    if (binding.sent_pressed) return;
+    binding.sent_pressed = true;
+    binding.wm_scheduled.state_change = .none;
     @import("Compositor.zig").notify(.{ .keybind_pressed = binding });
     server.wm.dirtyWindowing();
 }
 
 pub fn stopRepeat(binding: *XkbBinding) void {
-    assert(binding.sent_pressed);
-    assert(binding.wm_scheduled.state_change == .none or
-        binding.wm_scheduled.state_change == .stop_repeat);
-    binding.wm_scheduled.state_change = .stop_repeat;
-    server.wm.dirtyWindowing();
+    // Repeat suppression is a river-protocol concept (stop client repeat
+    // while a binding is held). Binding keys are eaten, not forwarded, so
+    // there is nothing to stop. Must be a no-op when no press is active:
+    // `KeyboardGroup.handleKey` calls this on every key event for all
+    // active binding presses.
+    if (!binding.sent_pressed) return;
 }
 
 pub fn released(binding: *XkbBinding) void {
-    assert(binding.sent_pressed);
-    assert(binding.wm_scheduled.state_change == .stop_repeat);
-    binding.wm_scheduled.state_change = .released;
+    if (!binding.sent_pressed) return;
+    binding.sent_pressed = false;
+    binding.wm_scheduled.state_change = .none;
     @import("Compositor.zig").notify(.{ .keybind_released = binding });
     server.wm.dirtyWindowing();
 }

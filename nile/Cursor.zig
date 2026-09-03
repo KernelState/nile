@@ -512,10 +512,9 @@ fn windowAtCursor(cursor: *Cursor) ?*Window {
 fn modHeld(cursor: *Cursor) bool {
     const wlr_keyboard = cursor.seat.wlr_seat.getKeyboard() orelse return false;
     const mods = wlr_keyboard.getModifiers();
-    // Adaptive: if WAYLAND_DISPLAY was set at startup we are nested → use Alt,
-    // otherwise we are the main compositor → use Super (logo).
-    const is_nested = std.c.getenv("WAYLAND_DISPLAY") != null;
-    if (is_nested) return mods.alt else return mods.logo;
+    // Adaptive: Alt when nested (Wayland/X11 backend, outer compositor owns
+    // Super), Super/logo on DRM/KMS — same rule as keybindings.
+    if (util.isNested()) return mods.alt else return mods.logo;
 }
 
 pub fn processButton(cursor: *Cursor, event: *const Seat.Event.PointerButton) void {
@@ -529,8 +528,8 @@ pub fn processButton(cursor: *Cursor, event: *const Seat.Event.PointerButton) vo
             return;
         }
 
-        // Adaptive mod-drag: Super when running as main compositor,
-        // Alt when nested (WAYLAND_DISPLAY already set → parent compositor).
+        // Adaptive mod-drag: Super when running on DRM/KMS,
+        // Alt when nested (Wayland/X11 backend).
         if (cursor.modHeld()) {
             if (cursor.windowAtCursor()) |win| {
                 if (event.button == 272 and cursor.seat.op == null) {
