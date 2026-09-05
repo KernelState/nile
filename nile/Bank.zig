@@ -9,7 +9,6 @@
 
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Thread = std.Thread;
@@ -123,17 +122,391 @@ fn makeCompositorOutput(out: *Output, alloc: Allocator) !protocols.Output {
     };
 }
 
-/// Collect all known windows. Returned slice and every item's strings are
-/// owned by the caller: deinit each item, then free the slice.
+/// Windows in most-recently-focused order (index 0 = currently focused).
+/// Main-thread only: mutated from `onCompositorEvent`, read from the
+/// request thread in `collectWindows` (same threading as the existing
+/// `server.wm.windows` reads there). Holds `Ref`s, so destroyed windows
+/// never dangle — stale entries are skipped on read and pruned on write.
+var focus_order: std.ArrayList(Window.Ref) = .empty;
+
+fn focusOrderIndexOf(ref: Window.Ref) ?usize {
+    for (focus_order.items, 0..) |item, i| {
+        if (item.key.index == ref.key.index and item.key.generation == ref.key.generation) return i;
+    }
+    return null;
+}
+
+/// Insert `ref` at the front (index 0). Caller must have removed any
+/// existing entry first (or know it is absent).
+fn focusOrderInsertFront(ref: Window.Ref) void {
+    focus_order.append(bank_alloc, undefined) catch return;
+    const items = focus_order.items;
+    var i = items.len - 1;
+    while (i > 0) {
+        items[i] = items[i - 1];
+        i -= 1;
+    }
+    items[0] = ref;
+}
+
+/// Move `win` to the front; append to the back first if never seen so no
+/// live window is ever missing from the list.
+fn focusOrderTrack(win: *Window) void {
+    if (focusOrderIndexOf(win.ref)) |idx| _ = focus_order.orderedRemove(idx);
+    focusOrderInsertFront(win.ref);
+}
+
+/// Ensure `win` is present without changing existing order (new windows go
+/// to the back; the later `window_focus_changed` moves them to front).
+fn focusOrderEnsure(win: *Window) void {
+    if (focusOrderIndexOf(win.ref) == null) focus_order.append(bank_alloc, win.ref) catch {};
+}
+
+/// Drop `ref` from the list (window destroyed). Order of the rest is kept.
+fn focusOrderRemove(ref: Window.Ref) void {
+    if (focusOrderIndexOf(ref)) |idx| _ = focus_order.orderedRemove(idx);
+}
+
+// ---------------------------------------------------------------------------
+// Window thumbnails — a ~1fps main-thread sweep + instant serve.
+//
+// Why a cache: client buffers may only be touched on the Wayland main
+// thread (a concurrent commit/destroy on another thread would be a
+// use-after-free), while `bankCallback` runs on the bank IO thread. So the
+// main thread grabs small RGBA thumbs into `thumbs` once a second and
+// `capture_window` serves the latest one immediately — the moment the shell
+// clicks, it gets a frame at most ~1s old.
+//
+// Payload budget: nilebank frames cap at 65535 bytes (`Header.length: u16`,
+// which would panic on overflow), so thumbs are at most 256px wide and the
+// serve path halves them until the deflated payload fits.
+// ---------------------------------------------------------------------------
+
+const thumb_max_width: usize = 256;
+const thumb_interval_ms: c_int = 1000;
+const thumb_max_payload: usize = 60000;
+
+const Thumb = struct {
+    width: u32,
+    height: u32,
+    rgba: []u8, // tightly packed, bank_alloc owned
+};
+
+var thumbs: std.AutoHashMap(u64, Thumb) = undefined;
+var thumbs_init: bool = false;
+var thumbs_mu: Io.Mutex = .init;
+var thumb_timer: ?*wl.EventSource = null;
+
+/// `Io` handle for the bank request thread (owns `bank_threaded`, set in
+/// `init` before serving starts). Only used for short mutex holds.
+fn ioForRequestThread() Io {
+    return bank_threaded.?.io();
+}
+
+/// `Io` handle for the Wayland main thread (timer sweep, event prune,
+/// deinit). Only used for short mutex holds.
+fn ioForMainThread() Io {
+    return Io.Threaded.global_single_threaded.io();
+}
+
+fn drmFourcc(a: u8, b: u8, c: u8, d: u8) u32 {
+    return @as(u32, a) | (@as(u32, b) << 8) | (@as(u32, c) << 16) | (@as(u32, d) << 24);
+}
+
+const drm_argb8888 = drmFourcc('A', 'R', '2', '4');
+const drm_xrgb8888 = drmFourcc('X', 'R', '2', '4');
+const drm_abgr8888 = drmFourcc('A', 'B', '2', '4');
+const drm_xbgr8888 = drmFourcc('X', 'B', '2', '4');
+
+/// Nearest-neighbor RGBA downscale. Main-thread or IO-thread safe: pure
+/// memcpy math on caller-owned slices.
+fn downscaleRgba(alloc: Allocator, src: []const u8, sw: usize, sh: usize, dw: usize, dh: usize) ![]u8 {
+    const out = try alloc.alloc(u8, dw * dh * 4);
+    errdefer alloc.free(out);
+    var y: usize = 0;
+    while (y < dh) : (y += 1) {
+        const sy = y * sh / dh;
+        var x: usize = 0;
+        while (x < dw) : (x += 1) {
+            const sx = x * sw / dw;
+            @memcpy(out[(y * dw + x) * 4 ..][0..4], src[(sy * sw + sx) * 4 ..][0..4]);
+        }
+    }
+    return out;
+}
+
+/// Convert 32-bit source pixels to a small owned RGBA thumb (downscaling
+/// with nearest-neighbor). Pure CPU math on caller-owned memory.
+fn convertToThumb(src: [*]const u8, stride: usize, bw: usize, bh: usize, format: u32) !Thumb {
+    const swap_rb = switch (format) {
+        drm_argb8888, drm_xrgb8888 => true, // LE bytes are B,G,R,A
+        drm_abgr8888, drm_xbgr8888 => false, // LE bytes are R,G,B,A
+        else => return error.UnsupportedFormat,
+    };
+    const has_alpha = (format == drm_argb8888 or format == drm_abgr8888);
+
+    var tw: usize = if (bw > thumb_max_width) thumb_max_width else bw;
+    var th: usize = bh * tw / bw;
+    if (th == 0) th = 1;
+    if (tw == 0) tw = 1;
+
+    const out = try bank_alloc.alloc(u8, tw * th * 4);
+    errdefer bank_alloc.free(out);
+    const bpp: usize = 4;
+    var y: usize = 0;
+    while (y < th) : (y += 1) {
+        const sy = y * bh / th;
+        const srow = src[sy * stride ..][0 .. bw * bpp];
+        const drow = out[y * tw * 4 ..][0 .. tw * 4];
+        var x: usize = 0;
+        while (x < tw) : (x += 1) {
+            const sx = x * bw / tw;
+            const s = srow[sx * 4 ..][0..4];
+            const d = drow[x * 4 ..][0..4];
+            d[0] = if (swap_rb) s[2] else s[0];
+            d[1] = s[1];
+            d[2] = if (swap_rb) s[0] else s[2];
+            d[3] = if (has_alpha) s[3] else 255;
+        }
+    }
+    return .{ .width = @intCast(tw), .height = @intCast(th), .rgba = out };
+}
+
+/// Grab one window's current client buffer into a small owned RGBA thumb.
+/// Main thread only (timer / map hook): no client commit or destroy can
+/// interleave, so buffer pointers stay valid throughout.
+///
+/// Two paths: direct CPU mapping first (free for SHM, cheap for mappable
+/// dmabuf), then renderer texture readback (works for any GPU buffer at
+/// the cost of a GPU round-trip). Either may fail per window per sweep;
+/// the caller keeps the stale frame then.
+fn grabWindowThumb(win: *Window) !Thumb {
+    const surf = win.rootSurface() orelse return error.NoSurface;
+    const cur = &surf.current;
+    const src_buf = cur.buffer orelse return error.NoBuffer;
+    const bw: usize = @intCast(cur.buffer_width);
+    const bh: usize = @intCast(cur.buffer_height);
+    if (bw == 0 or bh == 0 or bw > 16384 or bh > 16384) return error.BadDims;
+
+    // Fast path: direct CPU mapping.
+    {
+        var data: *anyopaque = undefined;
+        var format: u32 = 0;
+        var stride: usize = 0;
+        if (src_buf.beginDataPtrAccess(wlr.Buffer.data_ptr_access_flag.read, &data, &format, &stride)) {
+            defer src_buf.endDataPtrAccess();
+            if (stride >= bw * 4) {
+                const bytes: [*]const u8 = @ptrCast(data);
+                const fast = convertToThumb(bytes, stride, bw, bh, format) catch |err| blk: {
+                    if (err != error.UnsupportedFormat) return err;
+                    // else fall through to texture readback
+                    break :blk null;
+                };
+                if (fast) |thumb| return thumb;
+            }
+        }
+    }
+
+    // Fallback: renderer texture readback (GPU buffers that refuse mapping).
+    const tex = wlr.Texture.fromBuffer(server.renderer, src_buf) orelse return error.TextureImportFailed;
+    defer tex.destroy();
+    const format = tex.preferredReadFormat();
+    switch (format) {
+        drm_argb8888, drm_xrgb8888, drm_abgr8888, drm_xbgr8888 => {},
+        else => return error.UnsupportedFormat,
+    }
+    const tmp = try bank_alloc.alloc(u8, bw * bh * 4);
+    defer bank_alloc.free(tmp);
+    const tmp_ptr: *anyopaque = tmp.ptr;
+    if (!tex.readPixels(&.{
+        .data = tmp_ptr,
+        .format = format,
+        .stride = @intCast(bw * 4),
+        .dst_x = 0,
+        .dst_y = 0,
+        .src_box = .{ .x = 0, .y = 0, .width = @intCast(bw), .height = @intCast(bh) },
+    })) return error.ReadbackFailed;
+    return convertToThumb(tmp.ptr, bw * 4, bw, bh, format);
+}
+
+/// Consecutive sweeps with live windows but zero cached frames, and the
+/// last grab error seen. Feeds the self-silencing warn below so a broken
+/// pipeline is visible on the terminal instead of failing silently.
+var thumbs_empty_sweeps: u32 = 0;
+var thumbs_last_err: ?anyerror = null;
+
+/// Refresh every live window's thumb; drop thumbs of dead windows.
+/// Main thread only (timer callback).
+fn sweepThumbs() void {
+    if (!thumbs_init) return;
+    var it = server.wm.windows.iterator();
+    while (it.next()) |win| {
+        const id = windowIdFromRef(win.ref);
+        const thumb = grabWindowThumb(win) catch |err| {
+            thumbs_last_err = err;
+            continue; // keep stale frame
+        };
+        thumbs_mu.lockUncancelable(ioForMainThread());
+        if (thumbs.getPtr(id)) |old| {
+            bank_alloc.free(old.rgba);
+            old.* = thumb;
+        } else {
+            thumbs.put(id, thumb) catch bank_alloc.free(thumb.rgba);
+        }
+        thumbs_mu.unlock(ioForMainThread());
+    }
+    // Prune windows that no longer exist.
+    var dead: std.ArrayList(u64) = .empty;
+    defer dead.deinit(bank_alloc);
+    var kit = thumbs.keyIterator();
+    while (kit.next()) |k| {
+        if (windowFromId(k.*) == null) dead.append(bank_alloc, k.*) catch {};
+    }
+    if (dead.items.len > 0) {
+        thumbs_mu.lockUncancelable(ioForMainThread());
+        defer thumbs_mu.unlock(ioForMainThread());
+        for (dead.items) |id| {
+            const kv = thumbs.fetchRemove(id);
+            if (kv) |e| bank_alloc.free(e.value.rgba);
+        }
+    }
+    // Self-silencing health report: loud only while broken (live windows
+    // but nothing cached), quiet once frames flow.
+    thumbs_mu.lockUncancelable(ioForMainThread());
+    const cached = thumbs.count();
+    thumbs_mu.unlock(ioForMainThread());
+    var live: usize = 0;
+    var wit = server.wm.windows.iterator();
+    while (wit.next()) |_| live += 1;
+    if (live > 0 and cached == 0) {
+        thumbs_empty_sweeps += 1;
+        if (thumbs_empty_sweeps == 3 or thumbs_empty_sweeps % 30 == 0) {
+            if (thumbs_last_err) |e| {
+                log.warn("bank: thumbnails: {d} windows, 0 cached after {d} sweeps (last grab error: {s})", .{ live, thumbs_empty_sweeps, @errorName(e) });
+            } else {
+                log.warn("bank: thumbnails: {d} windows, 0 cached after {d} sweeps", .{ live, thumbs_empty_sweeps });
+            }
+        }
+    } else {
+        if (thumbs_empty_sweeps >= 3 and cached > 0)
+            log.info("bank: thumbnails flowing again ({d} cached)", .{cached});
+        thumbs_empty_sweeps = 0;
+    }
+}
+
+fn handleThumbTimer(_: ?*anyopaque) c_int {
+    sweepThumbs();
+    if (thumb_timer) |t| t.timerUpdate(thumb_interval_ms) catch |err| {
+        log.warn("bank: thumbnail timer re-arm failed: {}", .{err});
+    };
+    return 0;
+}
+
+fn pruneThumb(id: u64) void {
+    if (!thumbs_init) return;
+    thumbs_mu.lockUncancelable(ioForMainThread());
+    defer thumbs_mu.unlock(ioForMainThread());
+    const kv = thumbs.fetchRemove(id);
+    if (kv) |e| bank_alloc.free(e.value.rgba);
+}
+
+/// Serve one `capture_window` from the thumbnail cache. Runs on the bank IO
+/// thread: only memcpys under a short mutex hold, never touching client
+/// buffers. Returns an already-encoded message; the payload is shrunk until
+/// it fits the 64KiB frame budget, else error code 3 (client backs off and
+/// retries — a fresh sweep lands within ~1s).
+fn serveCaptureWindowMessage(alloc: Allocator, window_id: u64) !nilebank.Message {
+    const errEv = struct {
+        fn msg(a: Allocator, code: u32, text: []const u8) !nilebank.Message {
+            const ev: protocols.Event = .{ .error_msg = .{ .code = code, .message = try a.dupe(u8, text) } };
+            defer ev.deinit(a);
+            return try nilebank.encodeCompositorEvent(a, ev, protocols.encodingForEvent(.error_msg));
+        }
+    }.msg;
+
+    if (windowFromId(window_id) == null)
+        return errEv(alloc, 2, "window not found");
+
+    thumbs_mu.lockUncancelable(ioForRequestThread());
+    const cached = thumbs.get(window_id);
+    var rgba: []u8 = if (cached) |c| alloc.dupe(u8, c.rgba) catch &.{} else &.{};
+    const cw: u32 = if (cached) |c| c.width else 0;
+    const ch: u32 = if (cached) |c| c.height else 0;
+    thumbs_mu.unlock(ioForRequestThread());
+    if (rgba.len == 0)
+        return errEv(alloc, 3, "no frame yet");
+
+    // NOTE: `ev` below borrows `rgba`; it is never passed to `deinit`
+    // (which would free `rgba` out from under the retry loop). `rgba` is
+    // freed exactly once on every path below.
+    var w: usize = cw;
+    var h: usize = ch;
+    while (true) {
+        const ev: protocols.Event = .{ .window_image = .{
+            .window_id = window_id,
+            .image = .{ .width = @intCast(w), .height = @intCast(h), .stride = @intCast(w * 4), .format = .rgba8, .data = rgba },
+        } };
+        const out = nilebank.encodeCompositorEvent(alloc, ev, protocols.encodingForEvent(.window_image)) catch {
+            alloc.free(rgba);
+            return errEv(alloc, 1, "out of memory");
+        };
+        if (out.data.len <= thumb_max_payload or (w <= 32 or h <= 32)) {
+            alloc.free(rgba);
+            return out;
+        }
+        // Too big even deflated: halve and try again.
+        alloc.free(@constCast(out.data));
+        const nw: usize = @max(32, w / 2);
+        const nh: usize = @max(32, h / 2);
+        const smaller = downscaleRgba(alloc, rgba, w, h, nw, nh) catch {
+            alloc.free(rgba);
+            return errEv(alloc, 1, "out of memory");
+        };
+        alloc.free(rgba);
+        rgba = smaller;
+        w = nw;
+        h = nh;
+    }
+}
+
+/// Drop refs whose windows no longer exist.
+fn focusOrderPrune() void {
+    var i = focus_order.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (focus_order.items[i].get() == null) _ = focus_order.orderedRemove(i);
+    }
+}
+
+/// Collect all known windows in focus order: currently focused first, then
+/// latest focused, down to least recently focused. Windows never focused
+/// (or missed by the tracker) are appended at the end in slotmap order, so
+/// the result always contains every live window. Returned slice and every
+/// item's strings are owned by the caller: deinit each item, then free
+/// the slice.
 fn collectWindows(alloc: Allocator) ![]protocols.Window {
     var wins: std.ArrayList(protocols.Window) = .empty;
     errdefer {
         for (wins.items) |w| w.deinit(alloc);
         wins.deinit(alloc);
     }
+    // MRU first; skip stale refs (destroyed since last prune).
+    for (focus_order.items) |ref| {
+        if (ref.get()) |win| {
+            try wins.append(alloc, try makeCompositorWindow(win, alloc));
+        }
+    }
+    // Leftovers: live windows not in the tracker (never focused yet).
     var it = server.wm.windows.iterator();
     while (it.next()) |win| {
-        try wins.append(alloc, try makeCompositorWindow(win, alloc));
+        var seen = false;
+        for (focus_order.items) |ref| {
+            if (ref.key.index == win.ref.key.index and ref.key.generation == win.ref.key.generation) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try wins.append(alloc, try makeCompositorWindow(win, alloc));
     }
     return wins.toOwnedSlice(alloc);
 }
@@ -243,6 +616,8 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                     seat.wm_requested.focus = .{ .window = win.ref };
                     server.wm.dirtyWindowing();
                     log.info("bank: focus window {d}", .{id});
+                } else {
+                    log.warn("bank: focus window {d}: unknown id", .{id});
                 }
             },
             .close_window => |id| {
@@ -250,6 +625,8 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                     win.wm_requested.close = true;
                     server.wm.dirtyWindowing();
                     log.info("bank: close window {d}", .{id});
+                } else {
+                    log.warn("bank: close window {d}: unknown id", .{id});
                 }
             },
             .move_window => |v| {
@@ -259,6 +636,8 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                     win.startPosAnimation(v.x, v.y, true);
                     server.wm.dirtyRendering();
                     log.info("bank: move window {d} to {d},{d}", .{ v.id, v.x, v.y });
+                } else {
+                    log.warn("bank: move window {d}: unknown id", .{v.id});
                 }
             },
             .resize_window => |v| {
@@ -267,6 +646,8 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                     win.startSizeAnimation(@intCast(v.width), @intCast(v.height), true);
                     server.wm.dirtyWindowing();
                     log.info("bank: resize window {d} to {d}x{d}", .{ v.id, v.width, v.height });
+                } else {
+                    log.warn("bank: resize window {d}: unknown id", .{v.id});
                 }
             },
             .switch_workspace => |id| {
@@ -308,7 +689,7 @@ fn queueAsync(op: AsyncOp) void {
 
 var bank_gpa: Allocator = undefined;
 
-fn bankCallback(msg: nilebank.Message) anyerror!nilebank.Message {
+fn bankCallback(_: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Message {
     const alloc = bank_gpa;
     // Decode request
     const req = nilebank.decodeCompositorRequest(alloc, msg) catch |err| {
@@ -319,6 +700,18 @@ fn bankCallback(msg: nilebank.Message) anyerror!nilebank.Message {
         return try nilebank.encodeCompositorEvent(alloc, ev, enc);
     };
     defer req.deinit(alloc);
+
+    // Thumbnails are served from the 1fps main-thread cache (see above):
+    // return the pre-encoded frame immediately so the shell shows pixels
+    // on click instead of waiting.
+    if (req == .capture_window) {
+        return serveCaptureWindowMessage(alloc, req.capture_window.window_id) catch |err| {
+            log.warn("bank: capture serve failed: {}", .{err});
+            const ev: protocols.Event = .{ .error_msg = .{ .code = 1, .message = try alloc.dupe(u8, "capture failed") } };
+            defer ev.deinit(alloc);
+            return try nilebank.encodeCompositorEvent(alloc, ev, protocols.encodingForEvent(.error_msg));
+        };
+    }
 
     // Dispatch based on request tag
     const ev: protocols.Event = switch (req) {
@@ -376,7 +769,9 @@ fn bankCallback(msg: nilebank.Message) anyerror!nilebank.Message {
         },
         .subscribe => .{ .pong = .{ .nonce = 0 } },
         .unsubscribe => .{ .pong = .{ .nonce = 0 } },
-        .capture_full, .capture_output, .capture_window => .{
+        // .capture_window is served above from the thumbnail cache.
+        .capture_window => unreachable,
+        .capture_full, .capture_output => .{
             .error_msg = .{ .code = 3, .message = try alloc.dupe(u8, "capture not implemented") },
         },
         .focus_window => |v| blk: {
@@ -429,207 +824,52 @@ fn bankCallback(msg: nilebank.Message) anyerror!nilebank.Message {
 }
 
 // ---------------------------------------------------------------------------
-// Event stream — push state changes to shell clients
+// Event push — live state changes to shell clients (2-way connection)
 // ---------------------------------------------------------------------------
 //
-// The request/response socket above can only answer queries. Shells also need
-// *push* ("workspace 2 is active now", "window 7 closed") without polling,
-// plus the full current state the moment they connect so they can catch up.
-// That is what this second socket provides:
+// The request/response socket doubles as the push channel: nilebank's
+// `Server.broadcast` sends unsolicited events (`Header.push_id`) over the
+// same connection, and client readers route them to the event listener
+// instead of an outstanding `request`. Shells should:
+//   1. connect to `/tmp/arcos/compositor.sock`,
+//   2. query initial state (`list_windows`, `list_workspaces`, `list_outputs`),
+//   3. stay connected to receive pushes (`new_window`, `window_closed`, …).
+//      Decode each push with
+//      `protocols.compositor.Event.decodeAllocWith(alloc, kind, payload, encoding)`.
 //
-//   path:    /tmp/arcos/compositor-events.sock
-//   framing: [kind: u8][encoding: u8][length: u16 BE][payload] per message
-//            (same Header layout as nilebank; decode the payload with
-//            `protocols.compositor.Event.decodeAllocWith(alloc, kind, payload, encoding)`)
-//   on connect the server immediately sends, in order:
-//            windows_snapshot, workspaces_snapshot, outputs_snapshot
-//   then one message per state change as it happens (see `onCompositorEvent`).
+// Afterwards one message is pushed per state change: `new_window`,
+// `window_closed`, `window_focused`, `window_title_changed`,
+// `window_app_id_changed`, `window_state_changed`,
+// `window_workspace_changed`, `output_added`, `output_removed`,
+// `output_changed`, `workspace_created`, `workspace_removed`,
+// `workspace_activated`, `workspace_deactivated`, `switch_workspace`
+// (plus a full `windows` list re-push on focus change so shells see MRU
+// order without re-querying; renames arrive as a full
+// `workspaces_snapshot`). Pointer motion/buttons, frame ticks and keybinds
+// are intentionally not pushed — re-query (`list_windows`, …) for those.
 //
-// All stream state lives on the main Wayland thread: the listener is polled
-// by the Wayland event loop and `broadcast` is only called from the
-// `Compositor.broadcast_hook` (main thread) or the async-queue drain (also
-// main thread). Subscriber sockets are nonblocking; a client that cannot keep
-// up (short write / EAGAIN) is disconnected and expected to reconnect and
-// re-read the snapshots.
+// `broadcast` is only called from the main Wayland thread via the
+// `Compositor.broadcast_hook` (or the async-queue drain, also main thread).
+// `subscribe`/`unsubscribe` on the request socket are currently acknowledged
+// no-ops — staying connected is the subscription mechanism.
+// `switch_workspace` and `set_workspace_name` requests are applied
+// asynchronously on the main thread (acked with `pong`); the outcome arrives
+// as a push.
 
-pub const event_socket_id = "compositor-events";
-pub const event_socket_path = "/tmp/arcos/" ++ event_socket_id ++ ".sock";
-
-var event_listener_fd: posix.fd_t = -1;
-var event_listener_source: ?*wl.EventSource = null;
-/// Main-thread only. Nonblocking fds, pruned lazily on write failure.
-var event_subscribers: std.ArrayList(posix.fd_t) = .empty;
-
-fn writeAllNonblock(fd: posix.fd_t, buf: []const u8) !void {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const rc = linux.write(fd, buf.ptr + off, buf.len - off);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {
-                const n: usize = @intCast(rc);
-                if (n == 0) return error.Closed;
-                off += n;
-            },
-            .INTR => continue,
-            .AGAIN => return error.WouldBlock,
-            .PIPE => return error.Closed,
-            else => return error.WriteFailed,
-        }
-    }
-}
-
-fn writeFramed(fd: posix.fd_t, kind: u8, encoding: nilebank.Encoding, payload: []const u8) !void {
-    if (payload.len > std.math.maxInt(u16)) return error.TooLarge;
-    var hdr: [nilebank.Header.size]u8 = undefined;
-    hdr[0] = kind;
-    hdr[1] = @intFromEnum(encoding);
-    std.mem.writeInt(u16, hdr[2..4], @intCast(payload.len), .big);
-    try writeAllNonblock(fd, &hdr);
-    try writeAllNonblock(fd, payload);
-}
-
-fn encodeEvent(ev: protocols.Event) !nilebank.Message {
-    const tag: protocols.EventTag = @as(protocols.EventTag, ev);
-    return nilebank.encodeCompositorEvent(bank_alloc, ev, protocols.encodingForEvent(tag));
-}
-
-/// Encode `ev` and write it to `fd`. Consumes `ev` (frees its heap on return).
-fn sendEventTo(fd: posix.fd_t, ev: protocols.Event) !void {
-    var ev_mut = ev;
-    defer ev_mut.deinit(bank_alloc);
-    const msg = try encodeEvent(ev_mut);
-    defer if (msg.data.len > 0) bank_alloc.free(@constCast(msg.data));
-    try writeFramed(fd, msg.kind, msg.encoding, msg.data);
-}
-
-/// Push `ev` to all event-stream subscribers. Consumes `ev`. Slow or dead
-/// clients are disconnected (they re-sync via snapshots on reconnect).
-/// No-op when nobody is subscribed.
+/// Push `ev` to all connected clients. Consumes `ev`.
+/// No-op (besides freeing `ev`) when the server isn't up or nobody is
+/// connected.
 pub fn broadcast(ev: protocols.Event) void {
-    if (event_subscribers.items.len == 0) {
+    const s = bank_server_obj orelse {
         var drop = ev;
         drop.deinit(bank_alloc);
         return;
-    }
+    };
     var ev_mut = ev;
     defer ev_mut.deinit(bank_alloc);
-    const msg = encodeEvent(ev_mut) catch |err| {
-        log.warn("event stream: encode failed: {}", .{err});
-        return;
+    s.broadcastCompositorEventDefault(ev_mut) catch |err| {
+        log.warn("bank: broadcast failed: {}", .{err});
     };
-    defer if (msg.data.len > 0) bank_alloc.free(@constCast(msg.data));
-    var i = event_subscribers.items.len;
-    while (i > 0) {
-        i -= 1;
-        const fd = event_subscribers.items[i];
-        writeFramed(fd, msg.kind, msg.encoding, msg.data) catch {
-            _ = posix.system.close(fd);
-            _ = event_subscribers.swapRemove(i);
-            log.info("event stream: dropped slow subscriber (fd={d})", .{fd});
-        };
-    }
-}
-
-/// Catch-up: full state snapshot for a freshly connected subscriber.
-fn sendSnapshotsTo(fd: posix.fd_t) !void {
-    {
-        const items = try collectWindows(bank_alloc);
-        try sendEventTo(fd, .{ .windows_snapshot = .{ .items = items } });
-    }
-    {
-        const items = try collectWorkspaces(bank_alloc);
-        try sendEventTo(fd, .{ .workspaces_snapshot = .{ .items = items } });
-    }
-    {
-        const items = try collectOutputs(bank_alloc);
-        try sendEventTo(fd, .{ .outputs_snapshot = .{ .items = items } });
-    }
-}
-
-fn handleEventStream(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
-    while (true) {
-        const rc = linux.accept4(
-            event_listener_fd,
-            null,
-            null,
-            linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
-        );
-        switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            .AGAIN => break,
-            .INTR => continue,
-            else => |err| {
-                log.warn("event stream: accept failed: {}", .{err});
-                break;
-            },
-        }
-        const fd: posix.fd_t = @intCast(rc);
-        sendSnapshotsTo(fd) catch |err| {
-            log.warn("event stream: snapshot send failed: {}", .{err});
-            _ = posix.system.close(fd);
-            continue;
-        };
-        event_subscribers.append(bank_alloc, fd) catch {
-            _ = posix.system.close(fd);
-            continue;
-        };
-        log.info("event stream: new subscriber (fd={d})", .{fd});
-    }
-    return 0;
-}
-
-fn eventStreamInit() !void {
-    const fd_rc = linux.socket(
-        posix.AF.UNIX,
-        posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
-        0,
-    );
-    if (linux.errno(fd_rc) != .SUCCESS) return error.SocketFailed;
-    const fd: posix.fd_t = @intCast(fd_rc);
-    errdefer _ = posix.system.close(fd);
-
-    {
-        const io = Io.Threaded.global_single_threaded.io();
-        Io.Dir.deleteFileAbsolute(io, event_socket_path) catch {};
-    }
-
-    const SockAddrUn = extern struct {
-        family: u16,
-        path: [108]u8,
-    };
-    var addr = std.mem.zeroes(SockAddrUn);
-    addr.family = posix.AF.UNIX;
-    if (event_socket_path.len + 1 > addr.path.len) return error.NameTooLong;
-    @memcpy(addr.path[0..event_socket_path.len], event_socket_path);
-    const addr_len: posix.socklen_t = @intCast(@sizeOf(u16) + event_socket_path.len + 1);
-    if (linux.errno(linux.bind(fd, @ptrCast(&addr), addr_len)) != .SUCCESS) return error.BindFailed;
-    if (linux.errno(linux.listen(fd, 16)) != .SUCCESS) return error.ListenFailed;
-
-    event_listener_source = try server.wl_server.getEventLoop().addFd(
-        ?*anyopaque,
-        fd,
-        .{ .readable = true },
-        handleEventStream,
-        null,
-    );
-    event_listener_fd = fd;
-    log.info("bank: event stream listening on {s}", .{event_socket_path});
-}
-
-fn eventStreamDeinit() void {
-    if (event_listener_source) |es| {
-        es.remove();
-        event_listener_source = null;
-    }
-    if (event_listener_fd != -1) {
-        _ = posix.system.close(event_listener_fd);
-        event_listener_fd = -1;
-        const io = Io.Threaded.global_single_threaded.io();
-        Io.Dir.deleteFileAbsolute(io, event_socket_path) catch {};
-    }
-    for (event_subscribers.items) |fd| _ = posix.system.close(fd);
-    event_subscribers.deinit(bank_alloc);
-    event_subscribers = .empty;
 }
 
 fn windowIdOrZero(win: ?*Window) u64 {
@@ -653,14 +893,40 @@ fn windowStateEvent(win: *Window) protocols.Event {
 fn onCompositorEvent(event: Compositor.Event) void {
     switch (event) {
         .window_add => |win| {
+            focusOrderEnsure(win);
             const title_c = win.getTitle();
             const title = if (title_c) |c| std.mem.sliceTo(c, 0) else "";
             const owned = bank_alloc.dupe(u8, title) catch return;
             broadcast(.{ .new_window = .{ .title = owned, .id = windowIdFromRef(win.ref) } });
         },
-        .window_map => |win| broadcast(windowStateEvent(win)),
+        .window_map => |win| {
+            focusOrderEnsure(win);
+            // Opportunistic thumbnail: don't wait for the next 1s sweep so
+            // a freshly opened window has pixels on the first switcher open.
+            if (thumbs_init) {
+                if (grabWindowThumb(win)) |thumb| {
+                    const id = windowIdFromRef(win.ref);
+                    thumbs_mu.lockUncancelable(ioForMainThread());
+                    if (thumbs.getPtr(id)) |old| {
+                        bank_alloc.free(old.rgba);
+                        old.* = thumb;
+                    } else {
+                        thumbs.put(id, thumb) catch bank_alloc.free(thumb.rgba);
+                    }
+                    thumbs_mu.unlock(ioForMainThread());
+                } else |err| {
+                    thumbs_last_err = err;
+                }
+            }
+            broadcast(windowStateEvent(win));
+        },
         .window_unmap => |win| broadcast(windowStateEvent(win)),
-        .window_destroy => |win| broadcast(.{ .window_closed = .{ .id = windowIdFromRef(win.ref) } }),
+        .window_destroy => |win| {
+            focusOrderRemove(win.ref);
+            focusOrderPrune();
+            pruneThumb(windowIdFromRef(win.ref));
+            broadcast(.{ .window_closed = .{ .id = windowIdFromRef(win.ref) } });
+        },
         .window_title_changed => |win| {
             const title_c = win.getTitle();
             const title = if (title_c) |c| std.mem.sliceTo(c, 0) else "";
@@ -695,10 +961,26 @@ fn onCompositorEvent(event: Compositor.Event) void {
         .keybind_pressed => {},
         .keybind_released => {},
         .frame => {},
-        .window_focus_changed => |v| broadcast(.{ .window_focused = .{
-            .id = windowIdOrZero(v.new),
-            .old_id = windowIdOrZero(v.old),
-        } }),
+        .window_focus_changed => |v| {
+            // MRU bookkeeping: newly focused window goes to front. On
+            // focus-clear (`new == null`) the list is left as-is so it
+            // still reads most-recent-first.
+            if (v.new) |win| focusOrderTrack(win);
+            broadcast(.{ .window_focused = .{
+                .id = windowIdOrZero(v.new),
+                .old_id = windowIdOrZero(v.old),
+            } });
+            // Re-push the whole list (in MRU focus order) as a list_windows
+            // response so subscribed shells see the new focus order without
+            // re-querying. Skipped when nobody is connected to avoid
+            // wasted work.
+            if (bank_server_obj) |s| {
+                if (s.clientCount() != 0) {
+                    const items = collectWindows(bank_alloc) catch return;
+                    broadcast(.{ .windows = .{ .items = items } });
+                }
+            }
+        },
         .window_workspace_changed => |v| broadcast(.{ .window_workspace_changed = .{
             .id = windowIdFromRef(v.window.ref),
             .old_workspace = v.old_id,
@@ -769,19 +1051,42 @@ pub fn init() !void {
     // Remove stale socket if any
     Io.Dir.deleteFileAbsolute(io, socket_path) catch {};
 
-    bank_server_obj = try nilebank.serve(bank_alloc, io, socket_id, bankCallback);
+    bank_server_obj = try nilebank.serve(bank_alloc, io, socket_id, bankCallback, null);
     log.info("bank: listening on {s} (id={s})", .{ socket_path, socket_id });
 
-    // Push channel for shells. Best-effort: queries keep working if it fails.
-    eventStreamInit() catch |err| {
-        log.warn("bank: event stream unavailable: {}", .{err});
-    };
+    // 1fps window-thumbnail sweep (main thread; see section above). If the
+    // timer can't be created we simply keep answering capture_window with
+    // "no frame yet" as before.
+    thumbs = std.AutoHashMap(u64, Thumb).init(bank_alloc);
+    thumbs_init = true;
+    if (server.wl_server.getEventLoop().addTimer(?*anyopaque, handleThumbTimer, null)) |t| {
+        thumb_timer = t;
+        thumb_timer.?.timerUpdate(thumb_interval_ms) catch |err| {
+            log.warn("bank: thumbnail timer arm failed: {}", .{err});
+        };
+    } else |err| {
+        log.warn("bank: thumbnail timer unavailable: {}", .{err});
+    }
+
     Compositor.setBroadcastHook(&onCompositorEvent);
+    // Seed MRU order from current state: focused windows first, then the
+    // rest in slotmap order. Later focus events keep it up to date.
+    {
+        var sit = server.input_manager.seats.iterator(.forward);
+        while (sit.next()) |seat| {
+            if (seat.focused == .window) focusOrderTrack(seat.focused.window);
+        }
+        var wit = server.wm.windows.iterator();
+        while (wit.next()) |win| focusOrderEnsure(win);
+    }
 }
 
 pub fn deinit() void {
     Compositor.broadcast_hook = null;
-    eventStreamDeinit();
+    if (thumb_timer) |t| {
+        t.remove();
+        thumb_timer = null;
+    }
     if (bank_server_obj) |s| {
         s.deinit();
         bank_server_obj = null;
@@ -790,6 +1095,16 @@ pub fn deinit() void {
         t.deinit();
         bank_alloc.destroy(t);
         bank_threaded = null;
+    }
+    // After the IO threads are gone: no in-flight capture serve can touch
+    // the map anymore, so it is safe to free it here on the main thread.
+    if (thumbs_init) {
+        thumbs_mu.lockUncancelable(ioForMainThread());
+        var it = thumbs.iterator();
+        while (it.next()) |kv| bank_alloc.free(kv.value_ptr.rgba);
+        thumbs.deinit();
+        thumbs_mu.unlock(ioForMainThread());
+        thumbs_init = false;
     }
     if (bank_event_source) |es| {
         es.remove();
@@ -807,4 +1122,6 @@ pub fn deinit() void {
     async_queue.deinit(bank_alloc);
     async_queue = .empty;
     bank_mutex.unlock();
+    focus_order.deinit(bank_alloc);
+    focus_order = .empty;
 }

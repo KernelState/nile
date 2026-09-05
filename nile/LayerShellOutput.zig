@@ -65,17 +65,27 @@ fn sendConfigures(
                 continue;
             }
             {
-                var new_area = output.layer_shell.scheduled.non_exclusive_area;
+                // Overlay surfaces ignore exclusive zones: they are always
+                // configured against the full output area, so they can
+                // size themselves however they want, and they never
+                // shrink the usable area for other surfaces.
+                const ignore_exclusive = current.layer == .overlay;
+                var new_area = if (ignore_exclusive)
+                    output_box
+                else
+                    output.layer_shell.scheduled.non_exclusive_area;
                 layer_surface.scene_layer_surface.configure(&output_box, &new_area);
-                // Clients can request bogus exclusive zones larger than the output
-                // dimensions and river must handle this gracefully. It seems reasonable
-                // to close layer shell clients that would cause the usable area of the
-                // output to become less than half the width/height of its full dimensions.
-                if (new_area.width < output_width / 2 or new_area.height < output_height / 2) {
-                    layer_surface.wlr_layer_surface.destroy();
-                    continue;
+                if (!ignore_exclusive) {
+                    // Clients can request bogus exclusive zones larger than the output
+                    // dimensions and river must handle this gracefully. It seems reasonable
+                    // to close layer shell clients that would cause the usable area of the
+                    // output to become less than half the width/height of its full dimensions.
+                    if (new_area.width < output_width / 2 or new_area.height < output_height / 2) {
+                        layer_surface.wlr_layer_surface.destroy();
+                        continue;
+                    }
+                    output.layer_shell.scheduled.non_exclusive_area = new_area;
                 }
-                output.layer_shell.scheduled.non_exclusive_area = new_area;
             }
             const x = layer_surface.scene_layer_surface.tree.node.x;
             const y = layer_surface.scene_layer_surface.tree.node.y;

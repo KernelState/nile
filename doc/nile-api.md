@@ -230,30 +230,32 @@ compositor keeps Super) and Super/Logo on DRM/KMS. The same rule applies to
 mod-drag (move/resize). New windows open on the current workspace, and
 switching re-tiles for the newly visible set.
 
-### Shell event stream (`/tmp/arcos/compositor-events.sock`)
+### Shell event push (`/tmp/arcos/compositor.sock`, 2-way connection)
 
-The request/response socket (`/tmp/arcos/compositor.sock`) can only answer queries.
-Shells that need live state connect to the push socket instead:
+The request/response socket (`/tmp/arcos/compositor.sock`) doubles as the
+push channel: the server broadcasts unsolicited events (`Header.push_id`) over
+the same connection, and client readers route them to the event listener
+instead of an outstanding `request`. Shells that need live state should:
 
-- Framing per message is `[kind: u8][encoding: u8][length: u16 BE][payload]`
-  (the same `Header` layout nilebank uses). Decode `payload` with
-  `protocols.compositor.Event.decodeAllocWith(alloc, kind, payload, encoding)`.
-- On connect the server immediately sends `windows_snapshot`, `workspaces_snapshot`,
-  then `outputs_snapshot`, so a new client learns the exact current state and catches up.
-- Afterwards one message is pushed per state change: `new_window`, `window_closed`,
-  `window_focused`, `window_title_changed`, `window_app_id_changed`,
-  `window_state_changed`, `window_workspace_changed`, `output_added`,
-  `output_removed`, `output_changed`, `workspace_created`, `workspace_removed`,
-  `workspace_activated`, `workspace_deactivated`, `switch_workspace`
-  (renames arrive as a full `workspaces_snapshot`). Pointer motion/buttons, frame
-  ticks and keybinds are intentionally not pushed — re-query (`list_windows`, …) for those.
+1. connect with an event listener (`Connection.initPath(alloc, io, path, listener, ctx)`),
+2. query initial state (`list_windows`, `list_workspaces`, `list_outputs`),
+3. stay connected to receive pushes, decoding each with
+   `protocols.compositor.Event.decodeAllocWith(alloc, kind, payload, encoding)`.
 
-Sockets are nonblocking and owned by the main Wayland thread; a client that cannot
-keep up is disconnected and should reconnect (it will get fresh snapshots).
-`subscribe`/`unsubscribe` on the request socket are currently acknowledged no-ops —
-the event stream is the subscription mechanism. `switch_workspace` and
-`set_workspace_name` requests are applied asynchronously on the main thread (acked
-with `pong`); the outcome arrives on the event stream.
+One message is pushed per state change: `new_window`, `window_closed`,
+`window_focused`, `window_title_changed`, `window_app_id_changed`,
+`window_state_changed`, `window_workspace_changed`, `output_added`,
+`output_removed`, `output_changed`, `workspace_created`, `workspace_removed`,
+`workspace_activated`, `workspace_deactivated`, `switch_workspace`
+(a full `windows` list is re-pushed on focus change so shells see MRU focus
+order without re-querying; renames arrive as a full `workspaces_snapshot`).
+Pointer motion/buttons, frame ticks and keybinds are intentionally not pushed —
+re-query (`list_windows`, …) for those.
+`subscribe`/`unsubscribe` on the request socket are currently acknowledged
+no-ops — staying connected is the subscription mechanism.
+`switch_workspace` and `set_workspace_name` requests are applied
+asynchronously on the main thread (acked with `pong`); the outcome arrives
+as a push.
 
 ---
 
