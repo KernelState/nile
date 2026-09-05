@@ -295,7 +295,12 @@ pub fn manageFinish(wm: *WindowManager) void {
     {
         // Order is important here, Seat.manageFinish() must be called
         // before Window.manageFinish().
-        var it = wm.sent.seats.iterator(.forward);
+        // NOTE: iterate the live seat list, not wm.sent.seats: nothing ever
+        // appends seats to sent.seats (legacy external-WM bookkeeping), so
+        // iterating it silently skipped every seat and dropped all
+        // seat-mediated requests (window focus, pointer warp, move/resize
+        // ops) on the floor. manageStart() above uses the live list too.
+        var it = server.input_manager.seats.safeIterator(.forward);
         while (it.next()) |seat| seat.manageFinish();
     }
 
