@@ -158,6 +158,15 @@ pub const Focus = union(enum) {
     }
 };
 
+/// Focus remembered across a mod-tap shell detour. Slotmap refs (not raw
+/// pointers) so a window closed mid-detour resolves to null instead of
+/// dangling.
+pub const ShellPrevFocus = union(enum) {
+    window: Window.Ref,
+    layer_surface: LayerSurface.Ref,
+    none,
+};
+
 wlr_seat: *wlr.Seat,
 
 link: wl.list.Link,
@@ -242,6 +251,19 @@ relay: InputRelay,
 keyboard_groups: wl.list.Head(KeyboardGroup, .link),
 
 focused: Focus = .none,
+
+/// Mod-tap shell launcher state. Holding the MOD key (Alt when nested,
+/// Super otherwise — see `util.modMask`) focuses the registered shell layer surface; releasing MOD
+/// restores the previous focus, but only if the shell focus was gained by
+/// that hold and focus hasn't moved on since. The MOD key itself is swallowed
+/// (`KeyboardGroup.KeyConsumer.mod_tap`) unless keyboard focus is on a
+/// surface owned by the shell's own process (see `focusedIsShellProcess`),
+/// which receives MOD normally.
+shell_mod: struct {
+    focus_from_mod: bool = false,
+    shell: ?LayerSurface.Ref = null,
+    prev: ShellPrevFocus = .none,
+} = .{},
 
 /// The currently in progress drag operation type.
 drag: enum {
@@ -660,6 +682,144 @@ pub fn focus(seat: *Seat, new_focus: Focus) void {
     }
 }
 
+/// True for the MOD key itself: Alt_L/R when nested, Super_L/R on DRM/KMS
+/// — mirrors `util.modMask`.
+pub fn shellModSym(sym: xkb.Keysym) bool {
+    // NOTE: qualified access (not `.Super_L` literals): these are namespace
+    // constants inside the Keysym enum, not tagged members.
+    if (util.modIsAlt()) return sym == xkb.Keysym.Alt_L or sym == xkb.Keysym.Alt_R;
+    return sym == xkb.Keysym.Super_L or sym == xkb.Keysym.Super_R;
+}
+
+/// True if the given surface is the registered shell launcher surface.
+pub fn isShellSurface(surface: *wlr.Surface) bool {
+    const Bank = @import("Bank.zig");
+    const shell = Bank.findShellSurface() orelse return false;
+    return shell.wlr_layer_surface.surface == surface;
+}
+
+/// True if the seat's current keyboard focus is the registered shell.
+pub fn isShellFocused(seat: *Seat) bool {
+    if (seat.focused != .layer_surface) return false;
+    return isShellSurface(seat.focused.layer_surface.wlr_layer_surface.surface);
+}
+
+/// PID of the client that owns the registered shell surface, if any.
+pub fn shellPid() ?i32 {
+    const Bank = @import("Bank.zig");
+    const shell = Bank.findShellSurface() orelse return null;
+    return shell.wlr_layer_surface.surface.resource.getClient().getCredentials().pid;
+}
+
+/// True if the seat's current keyboard focus is a surface owned by the same
+/// OS process as the registered shell — the shell hub itself or any overlay
+/// or window spawned from that process. Those surfaces receive MOD normally;
+/// everywhere else it is swallowed (see `KeyboardGroup.KeyConsumer.mod_tap`).
+pub fn focusedIsShellProcess(seat: *Seat) bool {
+    const surface = seat.focused.surface() orelse return false;
+    const shell_pid = shellPid() orelse return false;
+    return surface.resource.getClient().getCredentials().pid == shell_pid;
+}
+
+/// Translate a libinput keycode for delivery to the shell: physical
+/// keycodes pass through unchanged regardless of which key MOD is, so this
+/// is identity.
+pub fn translateShellKeycode(keycode: u32) u32 {
+    return keycode;
+}
+
+/// Translate xkb modifier state for delivery to the shell: passed through
+/// unchanged regardless of which key MOD is, so this is identity.
+/// `_keymap`/`_mods` kept for the call sites.
+pub fn translateShellModifiers(keymap: *xkb.Keymap, mods: wlr.Keyboard.Modifiers) wlr.Keyboard.Modifiers {
+    _ = keymap;
+    return mods;
+}
+
+fn layerRefEql(a: LayerSurface.Ref, b: LayerSurface.Ref) bool {
+    return a.key.index == b.key.index and a.key.generation == b.key.generation;
+}
+
+/// Focus the registered shell surface, remembering the previous focus the
+/// first time (repeat calls while already detoured keep the original).
+/// Returns false when there is no shell surface to focus.
+fn shellFocusDetour(seat: *Seat) bool {
+    const Bank = @import("Bank.zig");
+    const shell = Bank.findShellSurface() orelse return false;
+    const on_shell = seat.focused == .layer_surface and
+        layerRefEql(seat.focused.layer_surface.ref, shell.ref);
+    if (!on_shell) {
+        if (!seat.shell_mod.focus_from_mod) {
+            seat.shell_mod.prev = switch (seat.focused) {
+                .window => |w| .{ .window = w.ref },
+                .layer_surface => |ls| .{ .layer_surface = ls.ref },
+                else => .none,
+            };
+            seat.shell_mod.shell = shell.ref;
+            seat.shell_mod.focus_from_mod = true;
+        }
+        seat.focus(.{ .layer_surface = shell });
+    }
+    return true;
+}
+
+/// Mod-tap shell launcher gesture, called from the key dispatch path for
+/// MOD-key presses and releases (`other_held` = other keys already down).
+/// Pure side effect on focus/broadcasts: the MOD key itself is swallowed by
+/// the caller (`KeyboardGroup.KeyConsumer.mod_tap`) unless focus is on a
+/// shell-process surface (see `focusedIsShellProcess`), which is forwarded
+/// normally.
+///
+/// Press (MOD alone, nothing else held): focus the registered shell layer
+/// surface, remember the previous focus, broadcast `launcher_opened`.
+/// Already within the shell's own UI (hub or a same-process overlay):
+/// leave focus alone so that surface receives MOD normally, with no
+/// detour and no broadcast.
+/// Release: broadcast `launcher_closed` and, if the shell focus is still on
+/// the shell, restore the previous focus. Combos (MOD+key) still run
+/// through normal keybinding matching first, so they work with the shell
+/// focused; on release the focus has already moved on and only the close
+/// broadcast fires.
+pub fn shellModTap(seat: *Seat, sym: xkb.Keysym, is_press: bool, other_held: bool) void {
+    // Inline import (cf. XkbBinding -> Compositor): keeps the module graph
+    // acyclic at the top level.
+    const Bank = @import("Bank.zig");
+    if (!shellModSym(sym)) return;
+    if (is_press) {
+        if (other_held or seat.shell_mod.focus_from_mod) return;
+        if (server.lock_manager.state == .locked) return;
+        if (seat.focusedIsShellProcess()) return;
+        if (!seat.shellFocusDetour()) return;
+        Bank.broadcast(.{ .launcher_opened = {} });
+    } else {
+        if (!seat.shell_mod.focus_from_mod) return;
+        seat.shell_mod.focus_from_mod = false;
+        const shell_ref = seat.shell_mod.shell;
+        seat.shell_mod.shell = null;
+        const on_shell = if (shell_ref) |r|
+            seat.focused == .layer_surface and layerRefEql(seat.focused.layer_surface.ref, r)
+        else
+            false;
+        if (on_shell) {
+            switch (seat.shell_mod.prev) {
+                .window => |ref| if (ref.get()) |win| {
+                    seat.focus(.{ .window = win });
+                } else {
+                    seat.focus(.none);
+                },
+                .layer_surface => |ref| if (ref.get()) |ls| {
+                    seat.focus(.{ .layer_surface = ls });
+                } else {
+                    seat.focus(.none);
+                },
+                .none => seat.focus(.none),
+            }
+        }
+        seat.shell_mod.prev = .none;
+        Bank.broadcast(.{ .launcher_closed = {} });
+    }
+}
+
 /// Send keyboard enter/leave events and handle pointer constraints
 /// This should never normally be called from outside of focus(), but we make an exception for
 /// XwaylandOverrideRedirect surfaces as they don't conform to the Wayland focus model.
@@ -681,11 +841,21 @@ fn keyboardNotifyEnter(seat: *Seat, wlr_surface: *wlr.Surface) void {
             if (press.consumer == .focus) keycodes.appendAssumeCapacity(keycode);
         }
 
-        seat.wlr_seat.keyboardNotifyEnter(
-            wlr_surface,
-            keycodes.items,
-            &group.state.modifiers,
-        );
+        if (isShellSurface(wlr_surface)) {
+            for (keycodes.items) |*kc| kc.* = translateShellKeycode(kc.*);
+            const translated = translateShellModifiers(group.config.keymap, group.state.modifiers);
+            seat.wlr_seat.keyboardNotifyEnter(
+                wlr_surface,
+                keycodes.items,
+                &translated,
+            );
+        } else {
+            seat.wlr_seat.keyboardNotifyEnter(
+                wlr_surface,
+                keycodes.items,
+                &group.state.modifiers,
+            );
+        }
     } else {
         seat.wlr_seat.keyboardNotifyEnter(wlr_surface, &.{}, null);
     }

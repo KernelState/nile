@@ -397,9 +397,8 @@ pub const NileCompositor = struct {
         self.arena.deinit();
     }
 
-    /// MOD + 1..9 switches to workspace <num>.
-    /// MOD is Alt when nested (Wayland/X11 backend) and Super/logo on
-    /// DRM/KMS — see `util.modMask`. All 9 workspaces are created at
+    /// MOD + 1..9 switches to workspace <num>. MOD is Alt when nested,
+    /// Super/logo on DRM/KMS (see `util.modMask`). All 9 workspaces are created at
     /// startup and always exist — no on-demand creation here.
     fn registerWorkspaceBindings(self: *NileCompositor) void {
         _ = self;

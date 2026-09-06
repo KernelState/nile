@@ -246,7 +246,8 @@ One message is pushed per state change: `new_window`, `window_closed`,
 `window_focused`, `window_title_changed`, `window_app_id_changed`,
 `window_state_changed`, `window_workspace_changed`, `output_added`,
 `output_removed`, `output_changed`, `workspace_created`, `workspace_removed`,
-`workspace_activated`, `workspace_deactivated`, `switch_workspace`
+`workspace_activated`, `workspace_deactivated`, `switch_workspace`,
+`launcher_opened`, `launcher_closed` (mod-tap shell gesture, see below)
 (a full `windows` list is re-pushed on focus change so shells see MRU focus
 order without re-querying; renames arrive as a full `workspaces_snapshot`).
 Pointer motion/buttons, frame ticks and keybinds are intentionally not pushed —
@@ -256,6 +257,27 @@ no-ops — staying connected is the subscription mechanism.
 `switch_workspace` and `set_workspace_name` requests are applied
 asynchronously on the main thread (acked with `pong`); the outcome arrives
 as a push.
+
+### Shell launcher (mod-tap)
+
+The shell declares its interactive layer surface with
+`shell_register { namespace }` (acked with `pong`; re-send on every
+reconnect, last writer wins). Holding the MOD key (Alt when nested,
+Super/Logo on DRM/KMS — see `util.modMask`) with nothing else held focuses
+that surface and broadcasts
+`launcher_opened`, so the shell can show its launcher UI. Releasing MOD
+broadcasts `launcher_closed` and, if focus is still on the shell, restores
+whatever had focus before the hold.
+The MOD key itself is swallowed for foreign clients — no press/release key
+event from the MOD press alone — the focus detour plus the broadcasts are
+the gesture. Surfaces owned by the shell's own process (the shell hub
+itself or any overlay/window it spawned, matched by client pid) receive
+MOD normally, so the shell can track MOD held state; if focus is already
+on one of those surfaces the detour leaves it alone (no refocus, no
+broadcast) and MOD is delivered straight to it.
+Key combos keep working throughout: keybindings are matched before focus
+dispatch, so MOD+key fires regardless of which surface has focus, and
+unmatched keys flow to the focused surface as usual.
 
 ---
 

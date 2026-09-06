@@ -43,8 +43,16 @@ fn isNestedIter(backend: *wlr.Backend, nested: *bool) void {
     }
 }
 
+/// True when MOD is Alt: nested inside another compositor/session — i.e. a
+/// Wayland or X11 backend is present — where the outer compositor keeps
+/// Super for itself.
+pub fn modIsAlt() bool {
+    return isNested();
+}
+
 /// The MOD modifier mask: Alt when nested (so the outer compositor keeps
-/// Super), Super/logo on DRM/KMS where Nile owns the hardware.
+/// Super), Super/logo on DRM/KMS.
 pub fn modMask() wlr.Keyboard.ModifierMask {
-    if (isNested()) return .{ .alt = true } else return .{ .logo = true };
+    if (modIsAlt()) return .{ .alt = true };
+    return .{ .logo = true };
 }

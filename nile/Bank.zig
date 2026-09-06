@@ -14,6 +14,7 @@ const Io = std.Io;
 const Thread = std.Thread;
 const wlr = @import("wlroots");
 const wl = @import("wayland").server.wl;
+const zwlr = @import("wayland").server.zwlr;
 const nilebank = @import("nilebank");
 const protocols = nilebank.protocols.compositor;
 
@@ -22,6 +23,8 @@ const util = @import("util.zig");
 const Window = @import("Window.zig");
 const Output = @import("Output.zig");
 const Compositor = @import("Compositor.zig");
+const LayerSurface = @import("LayerSurface.zig");
+const SceneNodeData = @import("SceneNodeData.zig");
 
 const log = std.log.scoped(.bank);
 
@@ -478,6 +481,54 @@ fn focusOrderPrune() void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shell registry — which layer surface is the interactive shell (launcher).
+//
+// The shell declares itself with `shell_register { namespace }` (last writer
+// wins; there is normally one shell). Mod-tap handling resolves the topmost
+// mapped surface with that namespace in the overlay/top layers and focuses
+// it. Written from the bank IO thread, read from the Wayland main thread.
+// ---------------------------------------------------------------------------
+
+var shell_namespace: ?[]u8 = null;
+var shell_mu: Io.Mutex = .init;
+
+/// Take ownership of an already-duped namespace, freeing the previous one.
+pub fn registerShell(namespace: []u8) void {
+    shell_mu.lockUncancelable(ioForRequestThread());
+    defer shell_mu.unlock(ioForRequestThread());
+    if (shell_namespace) |old| bank_alloc.free(old);
+    shell_namespace = namespace;
+}
+
+/// Topmost mapped layer surface in overlay/top layers whose namespace
+/// matches the registered shell, if any. Main thread only: the returned
+/// pointer is used immediately, so no client commit/destroy can interleave.
+pub fn findShellSurface() ?*LayerSurface {
+    shell_mu.lockUncancelable(ioForMainThread());
+    const ns = shell_namespace orelse {
+        shell_mu.unlock(ioForMainThread());
+        return null;
+    };
+    defer shell_mu.unlock(ioForMainThread());
+    for ([_]zwlr.LayerShellV1.Layer{ .overlay, .top }) |layer| {
+        const tree = server.scene.layerSurfaceTree(layer);
+        var it = tree.children.iterator(.reverse);
+        while (it.next()) |node| {
+            if (node.type != .tree) continue;
+            const node_data: *SceneNodeData = @ptrCast(@alignCast(node.data orelse continue));
+            const layer_surface = switch (node_data.data) {
+                .layer_surface => |ls| ls,
+                else => continue,
+            };
+            const wlr_layer_surface = layer_surface.wlr_layer_surface;
+            if (!wlr_layer_surface.surface.mapped) continue;
+            if (std.mem.eql(u8, std.mem.span(wlr_layer_surface.namespace), ns)) return layer_surface;
+        }
+    }
+    return null;
+}
+
 /// Collect all known windows in focus order: currently focused first, then
 /// latest focused, down to least recently focused. Windows never focused
 /// (or missed by the tracker) are appended at the end in slotmap order, so
@@ -808,6 +859,22 @@ fn bankCallback(_: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Message
             queueAsync(.{ .set_workspace_name = .{ .id = v.id, .name = owned } });
             break :blk .{ .pong = .{ .nonce = v.id } };
         },
+        .shell_register => |v| blk: {
+            // The shell declares its interactive layer surface by namespace
+            // (normally "nshell-hub"). Stored globally, last writer wins;
+            // mod-tap handling resolves it to the topmost mapped surface.
+            // Duplicated because `req` (and its strings) is freed when this
+            // callback returns, while the registry outlives it.
+            const owned = alloc.dupe(u8, v.namespace) catch break :blk .{
+                .error_msg = .{ .code = 1, .message = try alloc.dupe(u8, "out of memory") },
+            };
+            if (owned.len == 0) break :blk .{
+                .error_msg = .{ .code = 1, .message = try alloc.dupe(u8, "empty namespace") },
+            };
+            registerShell(owned);
+            log.info("bank: shell registered as '{s}'", .{owned});
+            break :blk .{ .pong = .{ .nonce = 0 } };
+        },
         .full_image, .window_image => .{
             .error_msg = .{ .code = 3, .message = try alloc.dupe(u8, "legacy image not implemented, use capture_*") },
         },
@@ -1095,6 +1162,10 @@ pub fn deinit() void {
         t.deinit();
         bank_alloc.destroy(t);
         bank_threaded = null;
+    }
+    if (shell_namespace) |ns| {
+        bank_alloc.free(ns);
+        shell_namespace = null;
     }
     // After the IO threads are gone: no in-flight capture serve can touch
     // the map anymore, so it is safe to free it here on the main thread.

@@ -512,9 +512,10 @@ fn windowAtCursor(cursor: *Cursor) ?*Window {
 fn modHeld(cursor: *Cursor) bool {
     const wlr_keyboard = cursor.seat.wlr_seat.getKeyboard() orelse return false;
     const mods = wlr_keyboard.getModifiers();
-    // Adaptive: Alt when nested (Wayland/X11 backend, outer compositor owns
-    // Super), Super/logo on DRM/KMS — same rule as keybindings.
-    if (util.isNested()) return mods.alt else return mods.logo;
+    // Adaptive mod-drag: Alt when nested, Super/logo on DRM/KMS
+    // (see `util.modMask`).
+    if (util.modIsAlt()) return mods.alt;
+    return mods.logo;
 }
 
 pub fn processButton(cursor: *Cursor, event: *const Seat.Event.PointerButton) void {
