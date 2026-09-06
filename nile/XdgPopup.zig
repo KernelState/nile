@@ -17,7 +17,12 @@ const SceneNodeData = @import("SceneNodeData.zig");
 const log = std.log.scoped(.xdg_popup);
 
 wlr_popup: *wlr.XdgPopup,
+/// Scene tree for the popup contents. Normally owned by wlroots (created with
+/// createSceneXdgSurface), but replaced by a compositor-owned snapshot tree
+/// while the close animation runs — see snapshotForClose().
 tree: *wlr.SceneTree,
+/// True if `tree` is the snapshot tree owned by us and must be destroyed on free.
+snapshot_owned: bool = false,
 capture_tree: ?*wlr.SceneTree = null,
 
 // Animation for popup appear/disappear (fade/scale/scfade). Config via Animation.popup_open/close.
@@ -108,12 +113,10 @@ fn handleAnimationTick(popup: *XdgPopup) c_int {
             popup.animation_timer = null;
         }
         if (popup.pending_destroy) {
-            // Close animation finished — now actually destroy
+            // Close animation finished — destroy the snapshot tree and free.
+            // Listeners were already removed in handleDestroy.
             popup.pending_destroy = false;
-            popup.destroy.link.remove();
-            popup.commit.link.remove();
-            popup.new_popup.link.remove();
-            popup.reposition.link.remove();
+            if (popup.snapshot_owned) popup.tree.node.destroy();
             util.gpa.destroy(popup);
         }
     } else {
@@ -201,21 +204,72 @@ fn startCloseAnimation(popup: *XdgPopup) bool {
 fn handleDestroy(listener: *wl.Listener(void)) void {
     const xdg_popup: *XdgPopup = @fieldParentPtr("destroy", listener);
 
-    // If popup close animation is enabled, fade out before destroying.
-    if (xdg_popup.startCloseAnimation()) {
-        // Keep listeners alive until animation finishes; mark pending destroy.
-        xdg_popup.pending_destroy = true;
-        // Don't remove listeners yet — handleAnimationTick will clean up.
-        return;
-    }
-
-    if (xdg_popup.animation_timer) |t| t.remove();
+    // Remove all listeners now — the wlr_popup, its surface, and the
+    // wlroots-owned scene tree created with createSceneXdgSurface are all
+    // about to be destroyed by wlroots.
     xdg_popup.destroy.link.remove();
     xdg_popup.commit.link.remove();
     xdg_popup.new_popup.link.remove();
     xdg_popup.reposition.link.remove();
 
+    // If the close animation is enabled, snapshot the popup's buffers into a
+    // compositor-owned scene tree and defer final cleanup until it finishes.
+    if (!xdg_popup.snapshot_owned and xdg_popup.startCloseAnimation()) {
+        if (xdg_popup.snapshotForClose()) {
+            xdg_popup.pending_destroy = true;
+            return;
+        }
+        // Snapshot failed (OOM) — fall back to immediate cleanup.
+    }
+
+    if (xdg_popup.animation_timer) |t| t.remove();
+    if (xdg_popup.snapshot_owned) xdg_popup.tree.node.destroy();
+
     util.gpa.destroy(xdg_popup);
+}
+
+/// Copy the popup's scene buffers into a new compositor-owned scene tree so
+/// they can be faded out after wlroots destroys the popup.
+///
+/// createSceneBuffer locks the underlying wlr_buffer, so the textures stay
+/// alive even after the client surface is destroyed. The tree is placed under
+/// interactive_tree with nodes positioned in layout coordinates, sibling-style
+/// like Scene.SaveableSurfaces.
+fn snapshotForClose(xdg_popup: *XdgPopup) bool {
+    const snapshot_tree = server.scene.interactive_tree.createSceneTree() catch return false;
+    errdefer snapshot_tree.node.destroy();
+
+    // forEachBuffer yields coordinates relative to popup.tree, whose origin
+    // differs from interactive_tree's. Translate the snapshot tree to the
+    // popup tree's layout position so the copy lands pixels-exactly on top of
+    // the original. Bail out if the popup is currently hidden (coords false)
+    // since its buffers would then be skipped by forEachBuffer anyway.
+    var lx: c_int = undefined;
+    var ly: c_int = undefined;
+    if (!xdg_popup.tree.node.coords(&lx, &ly)) return false;
+    snapshot_tree.node.setPosition(lx, ly);
+
+    const Cb = struct {
+        fn cb(buffer: *wlr.SceneBuffer, sx: c_int, sy: c_int, dest: *wlr.SceneTree) void {
+            const scene_buffer = dest.createSceneBuffer(buffer.buffer) catch {
+                log.err("failed to snapshot popup buffer, close animation will be incomplete", .{});
+                return;
+            };
+            scene_buffer.node.setPosition(sx, sy);
+            scene_buffer.setDestSize(buffer.dst_width, buffer.dst_height);
+            scene_buffer.setSourceBox(&buffer.src_box);
+            scene_buffer.setTransform(buffer.transform);
+        }
+    };
+    xdg_popup.tree.node.forEachBuffer(*wlr.SceneTree, Cb.cb, snapshot_tree);
+
+    // Take over the snapshot tree; from now on it owns all rendering and must
+    // be destroyed by us. Drop the wlroots-owned trees.
+    xdg_popup.tree = snapshot_tree;
+    xdg_popup.snapshot_owned = true;
+    xdg_popup.capture_tree = null;
+    xdg_popup.applyAlpha(xdg_popup.alpha);
+    return true;
 }
 
 fn handleCommit(listener: *wl.Listener(*wlr.Surface), _: *wlr.Surface) void {
