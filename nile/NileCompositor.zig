@@ -397,13 +397,16 @@ pub const NileCompositor = struct {
         self.arena.deinit();
     }
 
-    /// MOD + 1..9 switches to workspace <num>. MOD is Alt when nested,
-    /// Super/logo on DRM/KMS (see `util.modMask`). All 9 workspaces are created at
-    /// startup and always exist — no on-demand creation here.
+    /// MOD + 1..9 switches to workspace <num>. MOD+Shift+1..9 moves the
+    /// focused window to workspace <num>. MOD is Alt when nested, Super/logo
+    /// on DRM/KMS (see `util.modMask`). All 9 workspaces are created at startup
+    /// and always exist — no on-demand creation here.
     fn registerWorkspaceBindings(self: *NileCompositor) void {
         _ = self;
         const seat = Nile.Seat.default();
         const mod = @import("util.zig").modMask();
+        var shift_mod = mod;
+        shift_mod.shift = true;
         const keys = [_]xkb.Keysym{
             xkb.Keysym.@"1",
             xkb.Keysym.@"2",
@@ -421,6 +424,11 @@ pub const NileCompositor = struct {
                 continue;
             };
             _ = binding;
+            const move_binding = Nile.Seat.addXkbBinding(seat, sym, shift_mod) catch |err| {
+                log.warn("failed to register move-to-workspace binding: {}", .{err});
+                continue;
+            };
+            _ = move_binding;
         }
     }
 
@@ -439,6 +447,50 @@ pub const NileCompositor = struct {
             log.warn("failed to switch workspace {d}: {}", .{ num, err });
             return;
         };
+    }
+
+    /// Move the currently focused window to workspace <num>.
+    /// If no window is focused or the target is the current workspace, no-op.
+    fn moveFocusedWindowToWorkspace(self: *NileCompositor, num: u64) void {
+        _ = self;
+        if (num < 1 or num > @import("Workspace.zig").Manager.fixed_count) return;
+        const target_id = server.workspace.idForNumber(num) orelse {
+            log.warn("workspace {d} does not exist", .{num});
+            return;
+        };
+        const seat = Nile.Seat.default();
+        const win: *Window = switch (seat.focused) {
+            .window => |w| w,
+            else => {
+                log.info("move to workspace {d}: no focused window", .{num});
+                return;
+            },
+        };
+        if (win.wm_requested.workspace == target_id) return;
+        server.workspace.moveWindowToWorkspace(win, target_id) catch |err| {
+            log.warn("failed to move window to workspace {d}: {}", .{ num, err });
+            return;
+        };
+        // If we moved the focused window away from the current workspace it
+        // becomes hidden. Clear focus and focus the next window on the current
+        // workspace so keyboard doesn't stay on a hidden window.
+        if (target_id != server.workspace.currentWorkspace()) {
+            var it = Nile.Window.iter();
+            var next: ?*Window = null;
+            const cur_ws = server.workspace.currentWorkspace();
+            while (it.next()) |w| {
+                if (w == win) continue;
+                if (w.wm_requested.workspace != cur_ws) continue;
+                if (w.state != .mapped) continue;
+                next = w;
+                break;
+            }
+            if (next) |n| {
+                Nile.Seat.focusWindow(seat, n);
+            } else {
+                Nile.Seat.clearFocus(seat);
+            }
+        }
     }
 
     pub fn handle(self: *NileCompositor, event: Compositor.Event) void {
@@ -547,8 +599,14 @@ pub const NileCompositor = struct {
             // MOD+0 is unbound — Nile has exactly 9 workspaces.
             else => return,
         };
-        log.info("workspace keybinding: switch to {d}", .{num});
-        self.switchToWorkspaceNumber(num);
+        const mods: @import("wlroots").Keyboard.ModifierMask = @bitCast(binding.modifiers);
+        if (mods.shift) {
+            log.info("workspace keybinding: move focused window to {d}", .{num});
+            self.moveFocusedWindowToWorkspace(num);
+        } else {
+            log.info("workspace keybinding: switch to {d}", .{num});
+            self.switchToWorkspaceNumber(num);
+        }
     }
 
     /// A workspace became visible. Its tree is restored as-is — apply its

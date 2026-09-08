@@ -11,6 +11,7 @@
 //! Control is via `Nile.*` calls inside `handle` — e.g. `Nile.Window.setPosition`.
 
 const std = @import("std");
+const server = &@import("main.zig").server;
 const Nile = @import("Nile.zig");
 const Compositor = @import("Compositor.zig");
 const Window = @import("Window.zig");
@@ -156,9 +157,12 @@ pub const SimpleCompositor = struct {
         const out = Nile.Output.primary() orelse return;
         const box = Nile.Layer.nonExclusiveArea(out);
         if (box.width == 0 or box.height == 0) return;
+        const current_ws = server.workspace.currentWorkspace();
+        self.fba.reset();
         var wins = std.ArrayList(*Window).empty;
         var it = Nile.Window.iter();
         while (it.next()) |win| {
+            if (win.wm_requested.workspace != current_ws) continue;
             // Don't over allocate for no reason
             if (wins.items.len > 256 / @sizeOf(*Window)) break;
             switch (win.state) {
