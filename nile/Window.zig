@@ -307,7 +307,7 @@ pending_open: bool = false,
 /// Grabbed windows (seat.op.window) never animate to avoid input lag.
 animation: struct {
     active: bool = false,
-    kind: enum { tiling, open, close } = .tiling,
+    kind: enum { tiling, open, close, workspace } = .tiling,
     start_box: wlr.Box = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     target_box: wlr.Box = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     start_alpha: f32 = 1.0,
@@ -793,8 +793,16 @@ pub fn renderFinish(window: *Window) void {
     // If animating, let animation drive visual position/size to avoid snapping.
     // Do not touch box — tick interpolates it. Only keep enabled state current.
     if (window.animation.active) {
-        window.tree.node.setEnabled(!requested.hidden and (window.state == .mapped or window.state == .closing));
-        window.popup_tree.node.setEnabled(!requested.hidden and (window.state == .mapped or window.state == .closing));
+        // Workspace switch: keep windows visible during slide/fade even though
+        // outgoing windows are marked hidden (hidden=true). They should stay
+        // enabled until the workspace animation finishes, then hide.
+        const is_workspace = window.animation.kind == .workspace;
+        const enabled = if (is_workspace)
+            (window.state == .mapped or window.state == .closing)
+        else
+            (!requested.hidden and (window.state == .mapped or window.state == .closing));
+        window.tree.node.setEnabled(enabled);
+        window.popup_tree.node.setEnabled(enabled);
         return;
     }
 
@@ -1172,7 +1180,7 @@ inline fn nowMs() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
 }
 
-fn applyAlpha(window: *Window, alpha: f32) void {
+pub fn applyAlpha(window: *Window, alpha: f32) void {
     const clamped = @max(0.0, @min(1.0, alpha));
     window.alpha = clamped;
     // Apply opacity to all scene buffers in the window tree.
@@ -1470,6 +1478,32 @@ pub fn startCloseAnimation(window: *Window) bool {
     }
 }
 
+/// Workspace switch animation — slide or fade.
+/// For slide, `target` is off-screen for outgoing, on-screen for incoming.
+/// For fade, `target` is same box with alpha 0 (outgoing) or 1 (incoming).
+pub fn startWorkspaceAnimation(window: *Window, target: wlr.Box, target_alpha: f32, duration_ms: i64, easing: Animation.Easing) void {
+    // Workspace animations should not be blocked by grabbed check beyond isGrabbed;
+    // but we reuse startAnimationInternal which already handles it.
+    // Cancel tiling animation that might be in progress to avoid conflict.
+    // We call startAnimationInternal directly to animate box+alpha.
+    startAnimationInternal(window, target, target_alpha, 1.0, duration_ms, easing, .workspace);
+}
+
+/// Convenience for slide out: animate current box to off-screen target.
+pub fn startWorkspaceSlideOut(window: *Window, off_target: wlr.Box, duration_ms: i64, easing: Animation.Easing) void {
+    startWorkspaceAnimation(window, off_target, 1.0, duration_ms, easing);
+}
+
+/// Convenience for fade out: same box, alpha 1->0.
+pub fn startWorkspaceFadeOut(window: *Window, duration_ms: i64, easing: Animation.Easing) void {
+    startWorkspaceAnimation(window, window.box, 0.0, duration_ms, easing);
+}
+
+/// Convenience for fade in: same box, alpha 0->1. Caller should have set alpha 0.
+pub fn startWorkspaceFadeIn(window: *Window, duration_ms: i64, easing: Animation.Easing) void {
+    startWorkspaceAnimation(window, window.box, 1.0, duration_ms, easing);
+}
+
 pub fn tickAnimation(window: *Window, now_ms: i64) bool {
     // Handle deferred open animation (box not known at map time)
     if (window.pending_open) {
@@ -1498,9 +1532,18 @@ pub fn tickAnimation(window: *Window, now_ms: i64) bool {
         window.applySurfaceClip(&clip, &content_clip);
         // For close animation, keep enabled until final alpha 0 then hide
         const was_close = window.animation.kind == .close;
+        const was_workspace = window.animation.kind == .workspace;
         if (was_close and window.alpha <= 0.01) {
             window.tree.node.setEnabled(false);
             window.popup_tree.node.setEnabled(false);
+        }
+        if (was_workspace) {
+            // Workspace switch: restore correct visibility based on hidden flag.
+            // Outgoing windows (hidden=true) should now hide, even for slide
+            // where alpha stays 1. Incoming (hidden=false) stays visible.
+            const enabled = !window.rendering_requested.hidden and (window.state == .mapped or window.state == .closing);
+            window.tree.node.setEnabled(enabled);
+            window.popup_tree.node.setEnabled(enabled);
         }
         window.animation.active = false;
         if (was_close) {

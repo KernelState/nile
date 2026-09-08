@@ -11,6 +11,7 @@
 //! Control is via `Nile.*` calls inside `handle` — e.g. `Nile.Window.setPosition`.
 
 const std = @import("std");
+const wlr = @import("wlroots");
 const server = &@import("main.zig").server;
 const xkb = @import("xkbcommon");
 const Nile = @import("Nile.zig");
@@ -611,10 +612,197 @@ pub const NileCompositor = struct {
 
     /// A workspace became visible. Its tree is restored as-is — apply its
     /// saved geometry without rebuilding, so switching never retiles.
+    /// If workspace_switch animation is enabled (slide/fade), animate the
+    /// transition: outgoing windows slide/fade out, incoming slide/fade in.
+    /// Empty workspaces (no windows, root == null) are fully supported — the
+    /// outgoing workspace slides/fades out and the incoming stays empty.
     fn onWorkspaceSwitched(self: *NileCompositor, old_id: u64, new_id: u64) void {
-        _ = old_id;
-        _ = new_id;
-        self.layoutCurrent();
+        const Anim = @import("Animation.zig");
+        const cfg = Anim.get().workspace_switch;
+        if (!Anim.get().isWorkspaceSwitchEnabled()) {
+            self.layoutCurrent();
+            self.updateFocusForWorkspace(new_id);
+            return;
+        }
+        const out = Nile.Output.primary() orelse {
+            self.layoutCurrent();
+            self.updateFocusForWorkspace(new_id);
+            return;
+        };
+        const nea = Nile.Layer.nonExclusiveArea(out);
+        if (nea.width == 0 or nea.height == 0) {
+            self.layoutCurrent();
+            self.updateFocusForWorkspace(new_id);
+            return;
+        }
+        const output_box: Box = .{
+            .x = @intCast(nea.x),
+            .y = @intCast(nea.y),
+            .w = @intCast(nea.width),
+            .h = @intCast(nea.height),
+        };
+        const width: i32 = @intCast(nea.width);
+        const slide_sign: i32 = if (new_id > old_id) 1 else -1;
+        const duration: i64 = @intCast(cfg.duration_ms);
+        const easing = cfg.easing;
+        switch (cfg.kind) {
+            .none => {
+                self.layoutCurrent();
+                self.updateFocusForWorkspace(new_id);
+            },
+            .slide => {
+                // Outgoing: slide out off-screen (handles empty old workspace gracefully — no windows)
+                var it = Nile.Window.iter();
+                while (it.next()) |win| {
+                    if (win.wm_requested.workspace != old_id) continue;
+                    if (win.state != .mapped) continue;
+                    var target = win.box;
+                    target.x -= slide_sign * width;
+                    win.startWorkspaceSlideOut(target, duration, easing);
+                }
+                // Incoming: slide in from off-screen (empty workspace: no tree, nothing to animate)
+                if (self.rootFor(new_id).*) |*r| {
+                    self.animateWorkspaceSlideIn(r, output_box, width, slide_sign, duration, easing);
+                } else {
+                    self.ensureCurrentTree();
+                    if (self.cur().*) |*rr| {
+                        self.animateWorkspaceSlideIn(rr, output_box, width, slide_sign, duration, easing);
+                    } else {
+                        // New workspace is empty — no incoming windows to animate; outgoing still slides out to empty
+                    }
+                }
+                self.updateFocusForWorkspace(new_id);
+                Nile.dirtyWindowing();
+                Nile.dirtyRendering();
+            },
+            .fade => {
+                var it = Nile.Window.iter();
+                while (it.next()) |win| {
+                    if (win.wm_requested.workspace != old_id) continue;
+                    if (win.state != .mapped) continue;
+                    win.startWorkspaceFadeOut(duration, easing);
+                }
+                if (self.rootFor(new_id).*) |*r| {
+                    self.animateWorkspaceFadeIn(r, output_box, duration, easing);
+                } else {
+                    self.ensureCurrentTree();
+                    if (self.cur().*) |*rr| {
+                        self.animateWorkspaceFadeIn(rr, output_box, duration, easing);
+                    } else {
+                        // Empty incoming workspace — just fade out outgoing
+                    }
+                }
+                self.updateFocusForWorkspace(new_id);
+                Nile.dirtyWindowing();
+                Nile.dirtyRendering();
+            },
+        }
+    }
+
+    /// Focus the first window on workspace `id`, or clear focus if the workspace is empty.
+    /// Called on every workspace switch so that switching to an empty workspace does not leave
+    /// keyboard focus on a hidden window from the previous workspace.
+    fn updateFocusForWorkspace(self: *NileCompositor, id: u64) void {
+        _ = self;
+        var it = Nile.Window.iter();
+        var first: ?*Window = null;
+        while (it.next()) |win| {
+            if (win.wm_requested.workspace != id) continue;
+            if (win.state != .mapped) continue;
+            first = win;
+            break;
+        }
+        const seat = Nile.Seat.default();
+        if (first) |w| {
+            // Avoid redundant focus if already focused
+            switch (seat.focused) {
+                .window => |focused| if (focused == w) return,
+                else => {},
+            }
+            Nile.Seat.focusWindow(seat, w);
+        } else {
+            // Empty workspace — clear focus so input is not stuck on hidden window
+            if (seat.focused != .none) Nile.Seat.clearFocus(seat);
+        }
+    }
+
+    fn animateWorkspaceSlideIn(self: *NileCompositor, r: *Node, output_box: Box, output_width: i32, slide_sign: i32, duration: i64, easing: @import("Animation.zig").Easing) void {
+        _ = self;
+        workspaceSlideNode(r, output_box, output_width, slide_sign, duration, easing);
+    }
+
+    fn animateWorkspaceFadeIn(self: *NileCompositor, r: *Node, output_box: Box, duration: i64, easing: @import("Animation.zig").Easing) void {
+        _ = self;
+        workspaceFadeNode(r, output_box, duration, easing);
+    }
+
+    fn workspaceSlideNode(n: *Node, rbox: Box, output_width: i32, slide_sign: i32, duration: i64, easing: @import("Animation.zig").Easing) void {
+        switch (n.*) {
+            .leaf => |win| {
+                const target: wlr.Box = .{ .x = rbox.x, .y = rbox.y, .width = rbox.w, .height = rbox.h };
+                // Ensure client gets correct dimensions (without tiling animation)
+                win.wm_requested.dimensions = .{ .width = @intCast(rbox.w), .height = @intCast(rbox.h) };
+                const start: wlr.Box = .{ .x = target.x + slide_sign * output_width, .y = target.y, .width = target.width, .height = target.height };
+                // Place window at start off-screen immediately
+                win.box = start;
+                win.tree.node.setPosition(start.x, start.y);
+                win.popup_tree.node.setPosition(start.x, start.y);
+                win.rendering_requested.x = start.x;
+                win.rendering_requested.y = start.y;
+                win.alpha = 1.0;
+                win.applyAlpha(1.0);
+                win.startWorkspaceAnimation(target, 1.0, duration, easing);
+            },
+            .branch => |b| {
+                switch (b.orientation) {
+                    .vertical => {
+                        const h1: i32 = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.h)) * b.ratio));
+                        const h2: i32 = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.h)) * (1.0 - b.ratio)));
+                        workspaceSlideNode(b.first, .{ .x = rbox.x, .y = rbox.y, .w = rbox.w, .h = h1 }, output_width, slide_sign, duration, easing);
+                        workspaceSlideNode(b.second, .{ .x = rbox.x, .y = rbox.y + h1, .w = rbox.w, .h = h2 }, output_width, slide_sign, duration, easing);
+                    },
+                    .horizontal => {
+                        const w1: i32 = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.w)) * b.ratio));
+                        const w2: i32 = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.w)) * (1.0 - b.ratio)));
+                        workspaceSlideNode(b.first, .{ .x = rbox.x, .y = rbox.y, .w = w1, .h = rbox.h }, output_width, slide_sign, duration, easing);
+                        workspaceSlideNode(b.second, .{ .x = rbox.x + w1, .y = rbox.y, .w = w2, .h = rbox.h }, output_width, slide_sign, duration, easing);
+                    },
+                }
+            },
+        }
+    }
+
+    fn workspaceFadeNode(n: *Node, rbox: Box, duration: i64, easing: @import("Animation.zig").Easing) void {
+        switch (n.*) {
+            .leaf => |win| {
+                const target: wlr.Box = .{ .x = rbox.x, .y = rbox.y, .width = rbox.w, .height = rbox.h };
+                win.wm_requested.dimensions = .{ .width = @intCast(rbox.w), .height = @intCast(rbox.h) };
+                win.box = target;
+                win.tree.node.setPosition(target.x, target.y);
+                win.popup_tree.node.setPosition(target.x, target.y);
+                win.rendering_requested.x = target.x;
+                win.rendering_requested.y = target.y;
+                win.alpha = 0.0;
+                win.applyAlpha(0.0);
+                win.startWorkspaceAnimation(target, 1.0, duration, easing);
+            },
+            .branch => |b| {
+                switch (b.orientation) {
+                    .vertical => {
+                        const h1: i32 = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.h)) * b.ratio));
+                        const h2: i32 = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.h)) * (1.0 - b.ratio)));
+                        workspaceFadeNode(b.first, .{ .x = rbox.x, .y = rbox.y, .w = rbox.w, .h = h1 }, duration, easing);
+                        workspaceFadeNode(b.second, .{ .x = rbox.x, .y = rbox.y + h1, .w = rbox.w, .h = h2 }, duration, easing);
+                    },
+                    .horizontal => {
+                        const w1: i32 = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.w)) * b.ratio));
+                        const w2: i32 = @intFromFloat(@floor(@as(f64, @floatFromInt(rbox.w)) * (1.0 - b.ratio)));
+                        workspaceFadeNode(b.first, .{ .x = rbox.x, .y = rbox.y, .w = w1, .h = rbox.h }, duration, easing);
+                        workspaceFadeNode(b.second, .{ .x = rbox.x + w1, .y = rbox.y, .w = w2, .h = rbox.h }, duration, easing);
+                    },
+                }
+            },
+        }
     }
 
     /// A window moved between workspaces. Detach it from the old tree and

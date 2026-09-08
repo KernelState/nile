@@ -14,16 +14,19 @@
 //!     Kinds: `none`, `slide` (position+size lerp, current default).
 //!   - **popup_open / popup_close** — xdg-popup appear / disappear.
 //!     Kinds: `none`, `fade`, `scale`, `scfade`.
+//!   - **workspace_switch** — when switching workspaces.
+//!     Kinds: `none`, `slide` (windows slide horizontally), `fade` (cross-fade).
 //!
 //! JSON representation (future-proof):
 //! ```json
 //! {
 //!   "enabled": true,
-//!   "window_open":  { "kind": "scfade", "duration_ms": 220, "easing": "ease_out_cubic", "scale_from": 0.94 },
-//!   "window_close": { "kind": "fade",   "duration_ms": 180, "easing": "ease_out_cubic" },
-//!   "tiling":       { "kind": "slide",  "duration_ms": 200, "easing": "ease_out_cubic" },
-//!   "popup_open":   { "kind": "fade",   "duration_ms": 150, "easing": "ease_out_cubic" },
-//!   "popup_close":  { "kind": "fade",   "duration_ms": 120, "easing": "ease_out_cubic" }
+//!   "window_open":      { "kind": "scfade", "duration_ms": 220, "easing": "ease_out_cubic", "scale_from": 0.94 },
+//!   "window_close":     { "kind": "fade",   "duration_ms": 180, "easing": "ease_out_cubic" },
+//!   "tiling":           { "kind": "slide",  "duration_ms": 200, "easing": "ease_out_cubic" },
+//!   "popup_open":       { "kind": "fade",   "duration_ms": 150, "easing": "ease_out_cubic" },
+//!   "popup_close":      { "kind": "fade",   "duration_ms": 120, "easing": "ease_out_cubic" },
+//!   "workspace_switch": { "kind": "slide",  "duration_ms": 250, "easing": "ease_out_cubic" }
 //! }
 //! ```
 //! Missing keys fall back to defaults. Set `"enabled": false` or set every
@@ -69,6 +72,12 @@ pub const PopupKind = enum {
     scfade,
 };
 
+pub const WorkspaceSwitchKind = enum {
+    none,
+    slide,
+    fade,
+};
+
 pub const WindowOpenConfig = struct {
     kind: WindowKind = .scfade,
     duration_ms: u32 = 220,
@@ -104,6 +113,12 @@ pub const PopupCloseConfig = struct {
     scale_from: f32 = 0.94,
 };
 
+pub const WorkspaceSwitchConfig = struct {
+    kind: WorkspaceSwitchKind = .none,
+    duration_ms: u32 = 250,
+    easing: Easing = .ease_out_cubic,
+};
+
 pub const Config = struct {
     /// Master switch. If false, all animations behave as .none regardless of per-family kind.
     enabled: bool = true,
@@ -113,6 +128,7 @@ pub const Config = struct {
     tiling: TilingConfig = .{},
     popup_open: PopupOpenConfig = .{},
     popup_close: PopupCloseConfig = .{},
+    workspace_switch: WorkspaceSwitchConfig = .{},
 
     /// Return a config with every animation disabled (all kinds .none).
     pub fn disabled() Config {
@@ -123,6 +139,7 @@ pub const Config = struct {
             .tiling = .{ .kind = .none, .duration_ms = 0 },
             .popup_open = .{ .kind = .none, .duration_ms = 0 },
             .popup_close = .{ .kind = .none, .duration_ms = 0 },
+            .workspace_switch = .{ .kind = .none, .duration_ms = 0 },
         };
     }
 
@@ -133,6 +150,7 @@ pub const Config = struct {
         self.tiling.kind = .none;
         self.popup_open.kind = .none;
         self.popup_close.kind = .none;
+        self.workspace_switch.kind = .none;
     }
 
     pub fn isTilingEnabled(self: Config) bool {
@@ -149,6 +167,9 @@ pub const Config = struct {
     }
     pub fn isPopupCloseEnabled(self: Config) bool {
         return self.enabled and self.popup_close.kind != .none;
+    }
+    pub fn isWorkspaceSwitchEnabled(self: Config) bool {
+        return self.enabled and self.workspace_switch.kind != .none;
     }
 
     /// Serialize to JSON (allocates). Caller owns returned slice.
