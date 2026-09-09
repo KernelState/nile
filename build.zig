@@ -222,7 +222,19 @@ pub fn build(b: *Build) !void {
         });
         const run_slotmap_test = b.addRunArtifact(slotmap_test);
 
+        const floating_logic_test = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("common/floating_logic.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .use_llvm = use_llvm,
+            .use_lld = use_llvm,
+        });
+        const run_floating_logic_test = b.addRunArtifact(floating_logic_test);
+
         const test_step = b.step("test", "Run the tests");
         test_step.dependOn(&run_slotmap_test.step);
+        test_step.dependOn(&run_floating_logic_test.step);
     }
 }

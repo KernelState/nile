@@ -21,6 +21,19 @@ const protocols = nilebank.protocols.compositor;
 
 const log = std.log.scoped(.wm);
 
+pub const Mode = enum(u8) {
+    tiling = 0,
+    floating = 1,
+
+    pub fn fromU8(v: u8) ?Mode {
+        return switch (v) {
+            0 => .tiling,
+            1 => .floating,
+            else => null,
+        };
+    }
+};
+
 pub const Info = struct {
     id: u64,
     number: u64,
@@ -29,6 +42,8 @@ pub const Info = struct {
     current: bool = false,
     urgent: bool = false,
     output: u64 = 0,
+    /// Explicit per-workspace layout. `null` means inherit `Manager.default_mode`.
+    mode: ?Mode = null,
 
     pub fn deinit(self: Info, alloc: Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
@@ -44,11 +59,16 @@ pub const Manager = struct {
 
     workspaces: std.ArrayList(Info) = .empty,
     current: u64 = 1,
+    /// Global fallback when `Info.mode == null`. Lives in the compositor
+    /// conceptually but stored here so `Window.isEffectivelyFloating` can resolve
+    /// it without depending on `NileCompositor` (avoiding a cycle).
+    default_mode: Mode = .tiling,
 
     pub fn init(self: *Manager, alloc: Allocator) !void {
         self.* = .{
             .workspaces = try std.ArrayList(Info).initCapacity(alloc, fixed_count),
             .current = 1,
+            .default_mode = .tiling,
         };
         var i: u64 = 1;
         while (i <= fixed_count) : (i += 1) {
@@ -59,6 +79,7 @@ pub const Manager = struct {
                 .number = i,
                 .name = try alloc.dupe(u8, name),
                 .current = (i == self.current),
+                .mode = null,
             });
         }
     }
@@ -105,7 +126,7 @@ pub const Manager = struct {
             if (ws.number == number) return ws;
         }
         const id = self.nextId();
-        const ws = Info{ .id = id, .number = number, .name = try alloc.dupe(u8, name), .current = (id == self.current) };
+        const ws = Info{ .id = id, .number = number, .name = try alloc.dupe(u8, name), .current = (id == self.current), .mode = null };
         try self.workspaces.append(alloc, ws);
         Compositor.notify(.{ .workspace_created = id });
         return ws;
@@ -162,10 +183,97 @@ pub const Manager = struct {
         for (self.workspaces.items) |*ws| {
             if (ws.id == id) {
                 const owned = try alloc.dupe(u8, name);
-                ws.deinit(alloc);
+                // free old name but keep other fields
+                if (ws.name.len > 0) alloc.free(ws.name);
                 ws.name = owned;
                 Compositor.notify(.{ .workspace_renamed = id });
                 return;
+            }
+        }
+        return error.WorkspaceNotFound;
+    }
+
+    /// Get explicit per-workspace mode. `null` means inherit `default_mode`
+    /// or workspace not found (caller can distinguish via `getWorkspace` if needed).
+    pub fn getWorkspaceMode(self: *const Manager, id: u64) ?Mode {
+        for (self.workspaces.items) |ws| {
+            if (ws.id == id) return ws.mode;
+        }
+        return null;
+    }
+
+    /// Effective layout for `id` — explicit if set, otherwise `default_mode`.
+    /// Unknown ids also fall back to `default_mode` (sensible default, never null).
+    pub fn getEffectiveMode(self: *const Manager, id: u64) Mode {
+        for (self.workspaces.items) |ws| {
+            if (ws.id == id) return ws.mode orelse self.default_mode;
+        }
+        return self.default_mode;
+    }
+
+    /// Global fallback. Used when `Info.mode == null`.
+    pub fn getGlobalMode(self: *const Manager) Mode {
+        return self.default_mode;
+    }
+    pub fn setGlobalMode(self: *Manager, mode: Mode) void {
+        if (self.default_mode == mode) return;
+        self.default_mode = mode;
+        // Notify per-workspace where mode is inherited so shells re-evaluate effective state
+        for (self.workspaces.items) |ws| {
+            if (ws.mode == null) {
+                Compositor.notify(.{ .workspace_mode_changed = .{ .id = ws.id, .mode = mode } });
+            }
+        }
+        log.info("global workspace mode -> {s}", .{@tagName(mode)});
+        server.wm.dirtyWindowing();
+        server.wm.dirtyRendering();
+    }
+
+    /// Clear explicit mode so workspace inherits global.
+    pub fn clearWorkspaceMode(self: *Manager, id: u64) !void {
+        for (self.workspaces.items) |*ws| {
+            if (ws.id == id) {
+                if (ws.mode == null) return;
+                ws.mode = null;
+                const eff = self.default_mode;
+                Compositor.notify(.{ .workspace_mode_changed = .{ .id = id, .mode = eff } });
+                log.info("workspace {} mode cleared -> inherits {s}", .{ id, @tagName(eff) });
+                server.wm.dirtyWindowing();
+                server.wm.dirtyRendering();
+                return;
+            }
+        }
+        return error.WorkspaceNotFound;
+    }
+
+    /// Set a workspace layout mode (explicit).
+    pub fn setWorkspaceMode(self: *Manager, id: u64, mode: Mode) !void {
+        for (self.workspaces.items) |*ws| {
+            if (ws.id == id) {
+                if (ws.mode != null and ws.mode.? == mode) return;
+                ws.mode = mode;
+                Compositor.notify(.{ .workspace_mode_changed = .{ .id = id, .mode = mode } });
+                log.info("workspace {} mode -> {s}", .{ id, @tagName(mode) });
+                server.wm.dirtyWindowing();
+                server.wm.dirtyRendering();
+                return;
+            }
+        }
+        return error.WorkspaceNotFound;
+    }
+
+    /// Toggle a workspace mode tiling <-> floating (operates on effective mode, writes explicit).
+    pub fn toggleWorkspaceMode(self: *Manager, id: u64) !Mode {
+        for (self.workspaces.items) |*ws| {
+            if (ws.id == id) {
+                const cur = ws.mode orelse self.default_mode;
+                const new_mode: Mode = if (cur == .tiling) .floating else .tiling;
+                ws.mode = new_mode;
+                Compositor.notify(.{ .workspace_mode_changed = .{ .id = id, .mode = new_mode } });
+                log.info("workspace {} mode toggled -> {s}", .{ id, @tagName(new_mode) });
+                server.wm.dirtyWindowing();
+                server.wm.dirtyRendering();
+                return new_mode;
             }
         }
         return error.WorkspaceNotFound;

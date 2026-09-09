@@ -192,6 +192,15 @@ pub const Event = union(enum) {
 
     /// A workspace was renamed (`Workspace.Manager.setWorkspaceName`). Payload is the id.
     workspace_renamed: u64,
+
+    /// A workspace layout mode changed.
+    workspace_mode_changed: struct {
+        id: u64,
+        mode: @import("Workspace.zig").Mode,
+    },
+
+    /// A window's forced-floating flag changed.
+    window_floating_changed: *Window,
 };
 
 pub const VTable = struct {

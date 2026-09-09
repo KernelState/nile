@@ -241,9 +241,13 @@ fn handleRequestConfigure(
     // If unmapped, let the client do whatever it wants
     if (xwindow.xsurface.surface == null or !xwindow.xsurface.surface.?.mapped) {
         xwindow.xsurface.configure(event.x, event.y, event.width, event.height);
+        // Keep requested size as floating default (acknowledged)
+        xwindow.window.noteRequestedFloatingSize(event.width, event.height);
         return;
     }
 
+    // Acknowledge with tiling position but client's requested size, and remember that size for floating
+    xwindow.window.noteRequestedFloatingSize(event.width, event.height);
     xwindow.xsurface.configure(
         math.lossyCast(i16, xwindow.window.box.x),
         math.lossyCast(i16, xwindow.window.box.y),

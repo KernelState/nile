@@ -357,6 +357,8 @@ fn handleCommit(listener: *wl.Listener(*wlr.Surface), _: *wlr.Surface) void {
                 );
 
                 window.setDimensions(@intCast(toplevel.geometry.width), @intCast(toplevel.geometry.height));
+                // Keep client's requested size as default floating size (acknowledged with tiling but noted)
+                window.noteRequestedFloatingSize(@intCast(toplevel.geometry.width), @intCast(toplevel.geometry.height));
             } else if (old_geometry.x != toplevel.geometry.x or
                 old_geometry.y != toplevel.geometry.y)
             {

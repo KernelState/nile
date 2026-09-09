@@ -366,6 +366,23 @@ pub const WindowApi = struct {
         server.wm.dirtyWindowing();
     }
 
+    /// Whether the window is forced floating.
+    pub fn isFloating(window: *WindowMod) bool {
+        return window.floating;
+    }
+    /// Whether the window is effectively floating (forced or workspace mode is floating).
+    pub fn isEffectivelyFloating(window: *WindowMod) bool {
+        return window.isEffectivelyFloating();
+    }
+    /// Set forced floating (true = floating, false = tiling-follows-workspace).
+    pub fn setFloating(window: *WindowMod, floating: bool) void {
+        window.setFloating(floating);
+    }
+    /// Toggle forced floating. Returns new value.
+    pub fn toggleFloating(window: *WindowMod) bool {
+        return window.toggleFloating();
+    }
+
     /// Accessors for read-only window properties.
     pub fn title(window: *WindowMod) ?[*:0]const u8 {
         return window.getTitle();
@@ -731,6 +748,7 @@ pub const Layer = struct {
 pub const WorkspaceApi = struct {
     /// Workspace info returned by listWorkspaces and getWorkspace.
     pub const Info = Workspace.Info;
+    pub const Mode = Workspace.Mode;
 
     /// Switch to the workspace with the given id.
     pub fn switchWorkspace(id: u64) !u64 {
@@ -766,6 +784,68 @@ pub const WorkspaceApi = struct {
     /// Move a window to a different workspace.
     pub fn moveWindowToWorkspace(window: *WindowMod, id: u64) !void {
         try server.workspace.moveWindowToWorkspace(window, id);
+    }
+
+    /// Get explicit workspace layout mode. `null` means inherit global.
+    pub fn getWorkspaceMode(id: u64) ?Mode {
+        return server.workspace.getWorkspaceMode(id);
+    }
+
+    /// Effective mode — explicit if set, else global fallback.
+    pub fn getEffectiveWorkspaceMode(id: u64) Mode {
+        return server.workspace.getEffectiveMode(id);
+    }
+
+    /// Global fallback used when per-workspace mode is `null`.
+    pub fn getGlobalWorkspaceMode() Mode {
+        return server.workspace.getGlobalMode();
+    }
+    pub fn setGlobalWorkspaceMode(mode: Mode) void {
+        server.workspace.setGlobalMode(mode);
+    }
+
+    /// Clear explicit mode so workspace inherits global.
+    pub fn clearWorkspaceMode(id: u64) !void {
+        try server.workspace.clearWorkspaceMode(id);
+    }
+
+    /// Set workspace layout mode (explicit).
+    pub fn setWorkspaceMode(id: u64, mode: Mode) !void {
+        try server.workspace.setWorkspaceMode(id, mode);
+    }
+
+    /// Toggle workspace layout mode tiling <-> floating. Returns new mode.
+    pub fn toggleWorkspaceMode(id: u64) !Mode {
+        return server.workspace.toggleWorkspaceMode(id);
+    }
+
+    /// Toggle current workspace mode.
+    pub fn toggleCurrentWorkspaceMode() !Mode {
+        return server.workspace.toggleWorkspaceMode(server.workspace.currentWorkspace());
+    }
+
+    /// Current workspace mode (effective).
+    pub fn currentWorkspaceMode() Mode {
+        return server.workspace.getEffectiveMode(server.workspace.currentWorkspace());
+    }
+
+    /// Whether focusing a window on another workspace switches to it.
+    /// Default `true` (alt-tab anywhere). Shell can set `false` to keep
+    /// focus in current workspace only (`only_current = true`).
+    pub fn getFocusSwitchesWorkspace() bool {
+        return @import("Bank.zig").getFocusSwitchesWorkspace();
+    }
+    pub fn setFocusSwitchesWorkspace(v: bool) void {
+        @import("Bank.zig").setFocusSwitchesWorkspace(v);
+    }
+    /// Convenience: shell's `only_current_workspace` flag (inverse).
+    /// `true` = only show/focus windows in current workspace.
+    /// Default `false`.
+    pub fn getOnlyCurrentWorkspace() bool {
+        return !getFocusSwitchesWorkspace();
+    }
+    pub fn setOnlyCurrentWorkspace(v: bool) void {
+        setFocusSwitchesWorkspace(!v);
     }
 };
 

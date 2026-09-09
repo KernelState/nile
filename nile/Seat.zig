@@ -815,6 +815,18 @@ pub fn shellModTap(seat: *Seat, sym: xkb.Keysym, is_press: bool, other_held: boo
                 .none => seat.focus(.none),
             }
         }
+        // Deferred floating toggle: MOD+f while shell held staged a pending toggle
+        // on the window that was focused before the detour. Consume it now that
+        // MOD is released (input was copied to shell the whole time).
+        switch (seat.shell_mod.prev) {
+            .window => |ref| if (ref.get()) |win| {
+                if (win.consumePendingFloatingToggle()) {
+                    // Toggle via Window API so compositor policy handles tree/position
+                    _ = win.toggleFloating();
+                }
+            },
+            else => {},
+        }
         seat.shell_mod.prev = .none;
         Bank.broadcast(.{ .launcher_closed = {} });
     }

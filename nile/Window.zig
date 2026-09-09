@@ -319,6 +319,29 @@ animation: struct {
     easing: Animation.Easing = .ease_out_cubic,
 } = .{},
 
+/// Whether this window is forced floating (follows its own position/size
+/// even in a tiling workspace). When workspace mode is floating, all windows
+/// are effectively floating regardless of this flag.
+floating: bool = false,
+
+/// Saved floating geometry for toggling back: position and size when last floating.
+floating_box: ?wlr.Box = null,
+
+/// Natural / preferred floating size — captured from the client's initial
+/// `dimensions_hint` (min size or requested size) at launch. Used as the
+/// restore size when a tiled window becomes floating or when a maximized
+/// window is moved/resized (snap back). Kept even while tiling so we always
+/// know the window's own recommended size.
+floating_restore_box: ?wlr.Box = null,
+
+/// Saved geometry for maximize restore (floating windows)
+maximize_prev_box: ?wlr.Box = null,
+
+/// Pending deferred floating toggle when shell has focus via MOD-tap.
+/// Set by `requestToggleFloating` when MOD+f is pressed while shell is focused;
+/// consumed on MOD release so we float the window that was focused before the detour.
+pending_floating_toggle: bool = false,
+
 foreign_toplevel_handle: ?*wlr.ExtForeignToplevelHandleV1 = null,
 wlr_toplevel_handle: ?*wlr.ForeignToplevelHandleV1 = null,
 
@@ -428,6 +451,16 @@ pub fn setDimensionsHint(window: *Window, hint: DimensionsHint) void {
     window.wm_scheduled.dimensions_hint = hint;
     if (!meta.eql(window.wm_sent.dimensions_hint, hint)) {
         server.wm.dirtyWindowing();
+    }
+    // Capture natural size early so tiling->floating has a sensible size even before first map.
+    // This is the configure "request" size — we ack with tiling but keep the request as floating default.
+    if (hint.min_width != 0 or hint.min_height != 0) {
+        window.noteRequestedFloatingSize(hint.min_width, hint.min_height);
+    } else if (hint.max_width != 0 or hint.max_height != 0) {
+        window.noteRequestedFloatingSize(
+            if (hint.max_width != 0) hint.max_width else 800,
+            if (hint.max_height != 0) hint.max_height else 600,
+        );
     }
 }
 
@@ -1151,6 +1184,153 @@ pub fn notifyAppId(window: *Window) void {
     if (window.wlr_toplevel_handle) |handle| {
         if (window.getAppId()) |app_id| handle.setAppId(app_id);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Floating — per-window forced-floating vs workspace mode
+// ---------------------------------------------------------------------------
+
+/// Returns true if window should be treated as floating.
+/// Forced floating (`window.floating`) is always floating; otherwise floating
+/// if its workspace mode is `.floating`.
+pub fn isEffectivelyFloating(window: *Window) bool {
+    if (window.floating) return true;
+    return server.workspace.getEffectiveMode(window.wm_requested.workspace) == .floating;
+}
+
+/// Set forced-floating flag. Does not automatically re-layout; caller should
+/// handle tiling tree membership and dirty windowing/rendering.
+pub fn setFloating(window: *Window, floating: bool) void {
+    if (window.floating == floating) return;
+    // Save/restore floating geometry so toggle returns to previous floating spot
+    if (floating) {
+        window.floating_box = window.box;
+    }
+    window.floating = floating;
+    @import("Compositor.zig").notify(.{ .window_floating_changed = window });
+    // Also broadcast via window_state for shell thumbnails
+    // bank will pick up via window_floating_changed hook
+    server.wm.dirtyWindowing();
+    server.wm.dirtyRendering();
+}
+
+/// Toggle forced-floating. Returns new value.
+pub fn toggleFloating(window: *Window) bool {
+    const new = !window.floating;
+    setFloating(window, new);
+    return new;
+}
+
+/// Capture natural floating size from hints if not yet stored. Called on first
+/// hint/commit and lazily before any tiling->floating transition so we have a
+/// sensible restore size even if the window never floated before.
+/// Also records the size from the client's configure request (acknowledged with
+/// our own tiling handling) as the default floating size, clamped to the output
+/// exclusive zone. See `noteRequestedFloatingSize`.
+pub fn ensureFloatingRestoreBox(window: *Window) void {
+    if (window.floating_restore_box != null) return;
+    // Prefer client's hinted min size (its natural size) when tiling has not yet stretched it.
+    const hint = window.wm_sent.dimensions_hint;
+    var w: i32 = 0;
+    var h: i32 = 0;
+    if (hint.min_width != 0 and hint.min_height != 0) {
+        w = @intCast(hint.min_width);
+        h = @intCast(hint.min_height);
+    } else if (hint.max_width != 0 and hint.max_height != 0 and hint.max_width < 10000 and hint.max_height < 10000) {
+        // Some clients only set max; use it as hint when reasonable
+        w = @intCast(hint.max_width);
+        h = @intCast(hint.max_height);
+    }
+    if (w == 0 or h == 0) {
+        if (window.box.width != 0 and window.box.height != 0) {
+            w = window.box.width;
+            h = window.box.height;
+        } else if (window.rendering_sent.width != 0 and window.rendering_sent.height != 0) {
+            w = @intCast(window.rendering_sent.width);
+            h = @intCast(window.rendering_sent.height);
+        } else {
+            w = 800;
+            h = 600;
+        }
+    }
+    // Clamp to output exclusive zone (max = output size - margin) so floating default never exceeds visible area
+    if (@import("Nile.zig").Output.primary()) |out| {
+        const nea = @import("Nile.zig").Layer.nonExclusiveArea(out);
+        if (nea.width > 40 and nea.height > 40) {
+            const max_w: i32 = @intCast(nea.width - 40);
+            const max_h: i32 = @intCast(nea.height - 40);
+            w = @max(200, @min(w, max_w));
+            h = @max(150, @min(h, max_h));
+        } else {
+            w = @max(200, @min(w, 1920));
+            h = @max(150, @min(h, 1200));
+        }
+    } else {
+        w = @max(200, @min(w, 1920));
+        h = @max(150, @min(h, 1200));
+    }
+    window.floating_restore_box = .{ .x = window.box.x, .y = window.box.y, .width = w, .height = h };
+}
+
+/// Record the size the client requested via configure/geometry so that the
+/// floating default reflects the client's own desired size. We acknowledge the
+/// configure with our tiling handling but keep the requested size for future
+/// floating. Clamped to output exclusive zone. Called from xdg commit and
+/// from manage paths. Only overwrites `floating_restore_box` when it is null
+/// or when the window is currently tiling and the requested size is more
+/// specific than the current restore (e.g. natural size vs stretched tiling).
+pub fn noteRequestedFloatingSize(window: *Window, req_w: u31, req_h: u31) void {
+    if (req_w == 0 or req_h == 0) return;
+    var w: i32 = @intCast(req_w);
+    var h: i32 = @intCast(req_h);
+    // Clamp to output exclusive zone
+    if (@import("Nile.zig").Output.primary()) |out| {
+        const nea = @import("Nile.zig").Layer.nonExclusiveArea(out);
+        if (nea.width > 40 and nea.height > 40) {
+            w = @min(w, @as(i32, @intCast(nea.width - 40)));
+            h = @min(h, @as(i32, @intCast(nea.height - 40)));
+        }
+    }
+    w = @max(200, w);
+    h = @max(150, h);
+    if (window.floating_restore_box == null) {
+        window.floating_restore_box = .{ .x = window.box.x, .y = window.box.y, .width = w, .height = h };
+        return;
+    }
+    // If window is tiled and current restore is the stretched tiling size, prefer the client's natural request if smaller/more reasonable
+    if (!window.isEffectivelyFloating() and !window.floating) {
+        const cur = window.floating_restore_box.?;
+        // Only replace if requested is notably different and not just tiling stretch
+        if (w < cur.width or h < cur.height) {
+            // Keep position, update size
+            window.floating_restore_box = .{ .x = cur.x, .y = cur.y, .width = w, .height = h };
+        }
+    }
+    // For already-floating windows, keep restore in sync via updateFloatingRestoreBox on commit; don't overwrite here
+}
+
+/// Call after a floating position/size change so maximize/move restore stays current.
+/// Only updates if window is effectively floating (or was just floating).
+pub fn updateFloatingRestoreBox(window: *Window) void {
+    // Keep floating_restore_box in sync with current geometry when floating
+    if (!window.isEffectivelyFloating() and !window.floating) return;
+    if (window.box.width == 0 or window.box.height == 0) return;
+    // Preserve if we have a pending maximize restore (don't overwrite previous)
+    if (window.wm_requested.maximized) return;
+    window.floating_restore_box = window.box;
+    // Also keep floating_box updated for toggle back
+    window.floating_box = window.box;
+}
+
+/// Queue a deferred floating toggle to be applied after MOD is released.
+/// Used when MOD+f is pressed while shell has focus via mod-tap.
+pub fn requestToggleFloating(window: *Window) void {
+    window.pending_floating_toggle = true;
+}
+pub fn consumePendingFloatingToggle(window: *Window) bool {
+    const v = window.pending_floating_toggle;
+    window.pending_floating_toggle = false;
+    return v;
 }
 
 // ---------------------------------------------------------------------------

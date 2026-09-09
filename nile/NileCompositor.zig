@@ -19,6 +19,7 @@ const Compositor = @import("Compositor.zig");
 const Window = @import("Window.zig");
 const Output = @import("Output.zig");
 const XkbBinding = @import("XkbBinding.zig");
+const Bank = @import("Bank.zig");
 
 pub const Box = struct {
     w: i32,
@@ -431,6 +432,22 @@ pub const NileCompositor = struct {
             };
             _ = move_binding;
         }
+        // MOD+v: toggle current workspace tiling/floating
+        {
+            const b = Nile.Seat.addXkbBinding(seat, xkb.Keysym.v, mod) catch |err| {
+                log.warn("failed to register workspace mode toggle binding: {}", .{err});
+                return;
+            };
+            _ = b;
+        }
+        // MOD+f: toggle focused window forced-floating
+        {
+            const b = Nile.Seat.addXkbBinding(seat, xkb.Keysym.f, mod) catch |err| {
+                log.warn("failed to register window floating toggle binding: {}", .{err});
+                return;
+            };
+            _ = b;
+        }
     }
 
     /// Switch to the workspace with human number `num` (1..9).
@@ -505,12 +522,29 @@ pub const NileCompositor = struct {
             .output_update => |out| self.onOutputUpdate(out),
             .keybind_pressed => |binding| self.onKeybindPressed(binding),
             .window_fullscreen_request => |req| self.onFullscreen(req.window, req.output),
+            .window_maximize_request => |req| self.onMaximize(req.window, req.maximize),
             .workspace_switched => |v| self.onWorkspaceSwitched(v.old_id, v.new_id),
             .window_workspace_changed => |v| self.onWindowWorkspaceChanged(v.window, v.old_id, v.new_id),
+            .workspace_mode_changed => |v| self.onWorkspaceModeChanged(v.id, v.mode),
+            .window_floating_changed => |win| self.onWindowFloatingChanged(win),
+            .window_focus_changed => |v| self.onWindowFocusChanged(v.old, v.new),
             .pointer_motion => |ev| self.onPointerMotion(ev.seat, ev.x, ev.y, ev.dx, ev.dy, ev.time_msec),
             .pointer_button => |ev| self.onPointerButton(ev.seat, ev.window, ev.button, ev.state, ev.x, ev.y, ev.kind, ev.edges, ev.time_msec),
             .frame => self.onFrame(),
-            else => {}, // ignore everything else (title/app_id/parent/minimize/maximize etc.)
+            else => {}, // ignore everything else (title/app_id/parent/minimize etc.)
+        }
+    }
+
+    fn onWindowFocusChanged(self: *NileCompositor, old: ?*Window, new: ?*Window) void {
+        _ = old;
+        if (new) |win| {
+            if (win.isEffectivelyFloating()) {
+                self.raiseFloatingWindows();
+                // Stale focus order race: Bank hasn't yet moved `win` to front when this handler runs
+                // (CompositorNotifies global before broadcast_hook). Ensure newly focused is truly top.
+                Nile.Window.raiseToTop(win);
+                Nile.dirtyRendering();
+            }
         }
     }
 
@@ -519,6 +553,16 @@ pub const NileCompositor = struct {
         // New windows open on the current workspace (they default to id 1).
         const current_ws = server.workspace.currentWorkspace();
         win.wm_requested.workspace = current_ws;
+        // If workspace is floating or window is forced-floating, don't tile it
+        if (win.isEffectivelyFloating()) {
+            log.debug("Window added as floating (workspace mode {s}, forced {any})", .{ @tagName(server.workspace.getEffectiveMode(current_ws)), win.floating });
+            self.ensureFloatingPosition(win);
+            // Ensure it's on top after layout
+            self.layoutCurrent();
+            Nile.Window.raiseToTop(win);
+            self.raiseFloatingWindows();
+            return;
+        }
         if (self.cur().*) |*r| {
             const drop_x: i32 = @intCast(@max(0, win.box.x));
             const drop_y: i32 = @intCast(@max(0, win.box.y));
@@ -532,6 +576,7 @@ pub const NileCompositor = struct {
             self.cur().* = .{ .leaf = win };
             self.layoutCurrent();
         }
+        self.raiseFloatingWindows();
     }
 
     fn onWindowMap(self: *NileCompositor, win: *Window) void {
@@ -553,6 +598,7 @@ pub const NileCompositor = struct {
         // The window knows its workspace; detach it from that tree so the
         // other workspaces' tilings are untouched.
         const root = self.rootFor(win.wm_requested.workspace);
+        const ws_id = win.wm_requested.workspace;
         if (root.*) |*r| {
             if (r.* == .leaf) {
                 if (r.leaf == win) {
@@ -566,7 +612,14 @@ pub const NileCompositor = struct {
             const p = r.findParent(n) orelse return;
             const is_first = p.branch.first == n;
             p.pop(is_first);
-            if (root == self.cur()) self.layoutTree(r);
+            if (root == self.cur()) {
+                const mode = server.workspace.getEffectiveMode(ws_id);
+                if (mode == .floating) {
+                    self.layoutCurrent();
+                } else {
+                    self.layoutTree(r);
+                }
+            }
         }
     }
 
@@ -587,6 +640,24 @@ pub const NileCompositor = struct {
     }
 
     fn onKeybindPressed(self: *NileCompositor, binding: *XkbBinding) void {
+        // MOD+v: toggle workspace tiling/floating (no shift)
+        if (binding.keysym == xkb.Keysym.v) {
+            const mods: @import("wlroots").Keyboard.ModifierMask = @bitCast(binding.modifiers);
+            if (!mods.shift) {
+                log.info("workspace keybinding: toggle tiling/floating", .{});
+                self.toggleCurrentWorkspaceMode();
+                return;
+            }
+        }
+        // MOD+f: toggle focused window forced-floating (no shift)
+        if (binding.keysym == xkb.Keysym.f) {
+            const mods: @import("wlroots").Keyboard.ModifierMask = @bitCast(binding.modifiers);
+            if (!mods.shift) {
+                log.info("window keybinding: toggle floating", .{});
+                self.toggleFocusedWindowFloating();
+                return;
+            }
+        }
         const num: u64 = switch (binding.keysym) {
             xkb.Keysym.@"1" => 1,
             xkb.Keysym.@"2" => 2,
@@ -610,6 +681,379 @@ pub const NileCompositor = struct {
         }
     }
 
+    fn toggleCurrentWorkspaceMode(self: *NileCompositor) void {
+        const cur_id = server.workspace.currentWorkspace();
+        const new_mode = server.workspace.toggleWorkspaceMode(cur_id) catch |err| {
+            log.warn("failed to toggle workspace mode: {}", .{err});
+            return;
+        };
+        log.info("workspace {d} mode -> {s}", .{ cur_id, @tagName(new_mode) });
+        // Reconcile tiling tree membership: floating->tiling needs to re-insert
+        // windows that were floating only due to workspace mode, tiling->floating
+        // leaves positions as-is (no removal needed).
+        if (new_mode == .tiling) {
+            self.ensureCurrentTree();
+        }
+        self.layoutCurrent();
+        self.raiseFloatingWindows();
+        Nile.dirtyWindowing();
+        Nile.dirtyRendering();
+    }
+
+    fn resolveFloatingTarget(self: *NileCompositor, seat: *@import("Seat.zig")) ?*Window {
+        _ = self;
+        switch (seat.focused) {
+            .window => |w| return w,
+            .layer_surface => {
+                // Shell has focus via MOD-tap — act on the window that was focused before detour.
+                // Defer until MOD release so input is still copied to shell and we float THAT window.
+                if (seat.shell_mod.focus_from_mod) {
+                    switch (seat.shell_mod.prev) {
+                        .window => |ref| if (ref.get()) |prev_win| {
+                            // Mark for deferred toggle; Seat.shellModTap will consume on release
+                            prev_win.requestToggleFloating();
+                            log.info("toggle floating deferred to MOD release for window {?s}", .{prev_win.getTitle()});
+                            return null;
+                        },
+                        else => {},
+                    }
+                }
+                // Fallback: if shell focused without MOD-tap, try prev anyway immediately
+                switch (seat.shell_mod.prev) {
+                    .window => |ref| if (ref.get()) |prev_win| return prev_win,
+                    else => {},
+                }
+                return null;
+            },
+            else => {
+                if (seat.shell_mod.focus_from_mod) {
+                    switch (seat.shell_mod.prev) {
+                        .window => |ref| if (ref.get()) |prev_win| {
+                            prev_win.requestToggleFloating();
+                            log.info("toggle floating deferred to MOD release for window {?s}", .{prev_win.getTitle()});
+                            return null;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            },
+        }
+    }
+
+    fn toggleFocusedWindowFloating(self: *NileCompositor) void {
+        const seat = Nile.Seat.default();
+        const win = self.resolveFloatingTarget(seat) orelse {
+            log.info("toggle floating: no target window (deferred or none)", .{});
+            return;
+        };
+        const was_floating = win.floating;
+        const now_floating = win.toggleFloating();
+        log.info("window {?s} floating {} -> {}", .{ win.getTitle(), was_floating, now_floating });
+        if (now_floating) {
+            // Capture tiling position before removal for offset placement
+            const tiling_box = win.box;
+            win.ensureFloatingRestoreBox();
+            // Move from tiling tree to floating: remove from tree if present
+            const root = self.rootFor(win.wm_requested.workspace);
+            if (root.*) |*r| {
+                if (r.find(win)) |n| {
+                    if (r.* == .leaf) {
+                        root.* = null;
+                    } else if (r.findParent(n)) |p| {
+                        p.pop(p.branch.first == n);
+                        if (root == self.cur()) {
+                            const m = server.workspace.getEffectiveMode(win.wm_requested.workspace);
+                            if (m == .floating) self.layoutCurrent() else self.layoutTree(r);
+                        }
+                    }
+                }
+            }
+            // Place near previous tiling position with offset so it visibly pops out, using natural size
+            {
+                var count: i32 = 0;
+                var it = Nile.Window.iter();
+                while (it.next()) |other| {
+                    if (other == win) continue;
+                    if (other.wm_requested.workspace != win.wm_requested.workspace) continue;
+                    if (!other.isEffectivelyFloating()) continue;
+                    if (other.state != .mapped and other.state != .initialized and other.state != .ready) continue;
+                    count += 1;
+                }
+                // Restore tiling box temporarily for placeTiledAsFloating (which uses win.box as base)
+                const saved_box = win.box;
+                win.box = tiling_box;
+                self.placeTiledAsFloating(win, count);
+                // If place didn't change (box was zero), fallback to ensure
+                if (win.box.x == tiling_box.x and win.box.y == tiling_box.y and tiling_box.width != 0) {
+                    _ = saved_box;
+                }
+            }
+            Nile.Window.raiseToTop(win);
+        } else {
+            // Move from floating to tiling (only if workspace is tiling)
+            const ws_mode = server.workspace.getEffectiveMode(win.wm_requested.workspace);
+            if (ws_mode == .floating) {
+                // Workspace itself is floating: window remains effectively floating; nothing to tile
+                Nile.Window.raiseToTop(win);
+            } else {
+                const root = self.rootFor(win.wm_requested.workspace);
+                if (root.*) |*r| {
+                    if (r.find(win) == null) {
+                        const drop_x: i32 = @intCast(@max(0, win.box.x));
+                        const drop_y: i32 = @intCast(@max(0, win.box.y));
+                        r.append(self.gpa, win, drop_x, drop_y);
+                    }
+                } else {
+                    root.* = .{ .leaf = win };
+                }
+                if (root == self.cur()) self.layoutCurrent();
+            }
+        }
+        self.raiseFloatingWindows();
+        Nile.dirtyWindowing();
+        Nile.dirtyRendering();
+    }
+
+    fn ensureFloatingPosition(self: *NileCompositor, win: *Window) void {
+        _ = self;
+        // If window already has a sane box, keep it. Otherwise center on primary output (with cascade offset so multiple floatings overlap but are visible).
+        if (win.box.width != 0 and win.box.height != 0 and win.box.x != 0 and win.box.y != 0) return;
+        win.ensureFloatingRestoreBox();
+        const out = Nile.Output.primary() orelse return;
+        const nea = Nile.Layer.nonExclusiveArea(out);
+        if (nea.width == 0 or nea.height == 0) return;
+        var w: i32 = if (win.box.width != 0) win.box.width else 0;
+        var h: i32 = if (win.box.height != 0) win.box.height else 0;
+        if (w == 0 or h == 0) {
+            if (win.floating_restore_box) |fb| {
+                w = if (w == 0) fb.width else w;
+                h = if (h == 0) fb.height else h;
+            } else {
+                w = if (w == 0) @min(800, @divTrunc(nea.width * 3, 4)) else w;
+                h = if (h == 0) @min(600, @divTrunc(nea.height * 3, 4)) else h;
+            }
+        }
+        var x: i32 = nea.x + @divTrunc(nea.width - w, 2);
+        var y: i32 = nea.y + @divTrunc(nea.height - h, 2);
+        // Cascade offset based on number of other floating windows on same workspace so newcomers don't exactly cover previous
+        {
+            var count: i32 = 0;
+            var it = Nile.Window.iter();
+            while (it.next()) |other| {
+                if (other == win) continue;
+                if (other.wm_requested.workspace != win.wm_requested.workspace) continue;
+                if (!other.isEffectivelyFloating()) continue;
+                if (other.state != .mapped and other.state != .initialized and other.state != .ready) continue;
+                count += 1;
+            }
+            x += count * 24;
+            y += count * 24;
+            // Keep within output (wrap if exceeds)
+            if (x + w > nea.x + nea.width) x = nea.x + 20;
+            if (y + h > nea.y + nea.height) y = nea.y + 20;
+        }
+        Nile.Window.setPosition(win, x, y, false);
+        if (win.box.width == 0 or win.box.height == 0) {
+            Nile.Window.setDimensions(win, @intCast(w), @intCast(h), false);
+        } else {
+            // Ensure position is applied; dimensions already known
+            Nile.dirtyWindowing();
+            Nile.dirtyRendering();
+        }
+    }
+
+    /// Place a tiled window that is becoming floating near its tiling position with a small offset
+    /// so it visibly pops out of layout. Uses natural size if available.
+    fn placeTiledAsFloating(self: *NileCompositor, win: *Window, cascade_idx: i32) void {
+        _ = self;
+        win.ensureFloatingRestoreBox();
+        const out = Nile.Output.primary() orelse return;
+        const nea = Nile.Layer.nonExclusiveArea(out);
+        if (nea.width == 0 or nea.height == 0) return;
+        // Keep tiling position as base but offset to show it's out of layout
+        const base_x = win.box.x;
+        const base_y = win.box.y;
+        var w: i32 = win.box.width;
+        var h: i32 = win.box.height;
+        if (win.floating_restore_box) |fb| {
+            // Use natural size, not stretched tiling size, if we have it and it's reasonable
+            if (fb.width != 0 and fb.height != 0 and (fb.width < win.box.width or fb.height < win.box.height or win.box.width == 0)) {
+                w = fb.width;
+                h = fb.height;
+            }
+        }
+        if (w == 0) w = @min(800, @divTrunc(nea.width * 3, 4));
+        if (h == 0) h = @min(600, @divTrunc(nea.height * 3, 4));
+        // Clamp size to output exclusive zone (max = output - 40)
+        if (nea.width > 40) w = @min(w, @as(i32, @intCast(nea.width - 40)));
+        if (nea.height > 40) h = @min(h, @as(i32, @intCast(nea.height - 40)));
+        var x: i32 = base_x + 20 + cascade_idx * 16;
+        var y: i32 = base_y + 20 + cascade_idx * 16;
+        // Clamp to output
+        if (x + w > nea.x + nea.width) x = nea.x + nea.width - w - 20;
+        if (y + h > nea.y + nea.height) y = nea.y + nea.height - h - 20;
+        if (x < nea.x) x = nea.x + 20;
+        if (y < nea.y) y = nea.y + 20;
+        Nile.Window.setPosition(win, x, y, false);
+        if (w != win.box.width or h != win.box.height) {
+            Nile.Window.setDimensions(win, @intCast(w), @intCast(h), false);
+        } else {
+            Nile.dirtyWindowing();
+            Nile.dirtyRendering();
+        }
+        // Update restore box to this new floating geometry for future maximize snap-back
+        win.floating_box = .{ .x = x, .y = y, .width = w, .height = h };
+        win.updateFloatingRestoreBox();
+    }
+
+    fn raiseFloatingWindows(self: *NileCompositor) void {
+        _ = self;
+        const cur_id = server.workspace.currentWorkspace();
+        const focus_refs = Bank.focusOrderSlice();
+        // First raise any floating windows that have never been focused (not in focus_order) — they go to bottom
+        {
+            var it = Nile.Window.iter();
+            while (it.next()) |win| {
+                if (win.wm_requested.workspace != cur_id) continue;
+                if (!win.isEffectivelyFloating()) continue;
+                if (win.state != .mapped) continue;
+                var in_focus = false;
+                for (focus_refs) |ref| {
+                    if (ref.key.index == win.ref.key.index and ref.key.generation == win.ref.key.generation) {
+                        in_focus = true;
+                        break;
+                    }
+                }
+                if (!in_focus) Nile.Window.raiseToTop(win);
+            }
+        }
+        // Now raise in reverse focus order: least recent first, most recent (focused) last -> topmost
+        var i = focus_refs.len;
+        while (i > 0) {
+            i -= 1;
+            const ref = focus_refs[i];
+            if (ref.get()) |win| {
+                if (win.wm_requested.workspace != cur_id) continue;
+                if (!win.isEffectivelyFloating()) continue;
+                if (win.state != .mapped) continue;
+                Nile.Window.raiseToTop(win);
+            }
+        }
+    }
+
+    fn cascadeTiledToFloating(self: *NileCompositor, workspace_id: u64) void {
+        const focus_refs = Bank.focusOrderSlice();
+        var idx: i32 = 0;
+        // MRU first: idx 0 = focused (top), so offset 0 for top, increasing for behind windows
+        for (focus_refs) |ref| {
+            if (ref.get()) |win| {
+                if (win.wm_requested.workspace != workspace_id) continue;
+                if (win.floating) continue; // forced floating keeps its own position
+                if (win.state != .mapped) continue;
+                // Place near tiling position with small offset, using natural size
+                self.placeTiledAsFloating(win, idx);
+                idx += 1;
+            }
+        }
+        // Windows not in focus order (never focused) — place at end of cascade
+        {
+            var it = Nile.Window.iter();
+            while (it.next()) |win| {
+                if (win.wm_requested.workspace != workspace_id) continue;
+                if (win.floating) continue;
+                if (win.state != .mapped) continue;
+                var in_focus = false;
+                for (focus_refs) |ref| {
+                    if (ref.key.index == win.ref.key.index and ref.key.generation == win.ref.key.generation) {
+                        in_focus = true;
+                        break;
+                    }
+                }
+                if (in_focus) continue;
+                self.placeTiledAsFloating(win, idx);
+                idx += 1;
+            }
+        }
+    }
+
+    fn onWorkspaceModeChanged(self: *NileCompositor, id: u64, mode: @import("Workspace.zig").Mode) void {
+        // If not current workspace, just update future layout lazily
+        if (id != server.workspace.currentWorkspace()) return;
+        if (mode == .tiling) {
+            self.ensureCurrentTree();
+        } else {
+            // tiling -> floating: cascade tiled windows so they visually overlap in focus order
+            self.cascadeTiledToFloating(id);
+        }
+        self.layoutCurrent();
+        self.raiseFloatingWindows();
+        Nile.dirtyWindowing();
+        Nile.dirtyRendering();
+    }
+
+    fn onWindowFloatingChanged(self: *NileCompositor, win: *Window) void {
+        // Decoupled path: the Window.setFloating already toggled the bool,
+        // but tiling tree membership must match. Reuse same logic as toggleFocused but for any window.
+        // This is called for IPC-driven changes as well.
+        const is_floating = win.floating;
+        if (is_floating) {
+            const tiling_box = win.box;
+            win.ensureFloatingRestoreBox();
+            const root = self.rootFor(win.wm_requested.workspace);
+            if (root.*) |*r| {
+                if (r.find(win)) |n| {
+                    if (r.* == .leaf) {
+                        root.* = null;
+                    } else if (r.findParent(n)) |p| {
+                        p.pop(p.branch.first == n);
+                        if (root == self.cur()) {
+                            const m = server.workspace.getEffectiveMode(win.wm_requested.workspace);
+                            if (m == .floating) self.layoutCurrent() else self.layoutTree(r);
+                        }
+                    }
+                }
+            }
+            // If window had a sane tiling box, offset it to show out-of-layout; otherwise fallback to centering
+            if (tiling_box.width != 0 and tiling_box.height != 0) {
+                var count: i32 = 0;
+                var it = Nile.Window.iter();
+                while (it.next()) |other| {
+                    if (other == win) continue;
+                    if (other.wm_requested.workspace != win.wm_requested.workspace) continue;
+                    if (!other.isEffectivelyFloating()) continue;
+                    if (other.state != .mapped and other.state != .initialized and other.state != .ready) continue;
+                    count += 1;
+                }
+                win.box = tiling_box;
+                self.placeTiledAsFloating(win, count);
+            } else {
+                self.ensureFloatingPosition(win);
+            }
+            Nile.Window.raiseToTop(win);
+        } else {
+            const ws_mode = server.workspace.getEffectiveMode(win.wm_requested.workspace);
+            if (ws_mode == .tiling) {
+                const root = self.rootFor(win.wm_requested.workspace);
+                if (root.*) |*r| {
+                    if (r.find(win) == null) {
+                        const drop_x: i32 = @intCast(@max(0, win.box.x));
+                        const drop_y: i32 = @intCast(@max(0, win.box.y));
+                        r.append(self.gpa, win, drop_x, drop_y);
+                    }
+                } else {
+                    root.* = .{ .leaf = win };
+                }
+                if (root == self.cur()) self.layoutCurrent();
+            } else {
+                Nile.Window.raiseToTop(win);
+            }
+        }
+        self.raiseFloatingWindows();
+        Nile.dirtyWindowing();
+        Nile.dirtyRendering();
+    }
+
     /// A workspace became visible. Its tree is restored as-is — apply its
     /// saved geometry without rebuilding, so switching never retiles.
     /// If workspace_switch animation is enabled (slide/fade), animate the
@@ -617,10 +1061,16 @@ pub const NileCompositor = struct {
     /// Empty workspaces (no windows, root == null) are fully supported — the
     /// outgoing workspace slides/fades out and the incoming stays empty.
     fn onWorkspaceSwitched(self: *NileCompositor, old_id: u64, new_id: u64) void {
+        // If switching to a floating workspace that was toggled while not current,
+        // its tiled windows are still at tiled positions — cascade them now so they overlap.
+        if (server.workspace.getEffectiveMode(new_id) == .floating) {
+            self.cascadeTiledToFloating(new_id);
+        }
         const Anim = @import("Animation.zig");
         const cfg = Anim.get().workspace_switch;
         if (!Anim.get().isWorkspaceSwitchEnabled()) {
             self.layoutCurrent();
+            self.raiseFloatingWindows();
             self.updateFocusForWorkspace(new_id);
             return;
         }
@@ -668,9 +1118,29 @@ pub const NileCompositor = struct {
                     if (self.cur().*) |*rr| {
                         self.animateWorkspaceSlideIn(rr, output_box, width, slide_sign, duration, easing);
                     } else {
-                        // New workspace is empty — no incoming windows to animate; outgoing still slides out to empty
+                        // New workspace is empty (or floating with no tiled windows) — handle floating incoming
                     }
                 }
+                // Incoming floating windows: also slide in (they are not in tiling tree)
+                {
+                    var it2 = Nile.Window.iter();
+                    while (it2.next()) |win| {
+                        if (win.wm_requested.workspace != new_id) continue;
+                        if (!win.isEffectivelyFloating()) continue;
+                        if (win.state != .mapped) continue;
+                        self.ensureFloatingPosition(win);
+                        const target = win.box;
+                        // Ensure target is on-screen (tiling slide recomputes target from rbox; for floating we use current box as target)
+                        const start: @import("wlroots").Box = .{ .x = target.x + slide_sign * width, .y = target.y, .width = target.width, .height = target.height };
+                        win.box = start;
+                        win.tree.node.setPosition(start.x, start.y);
+                        win.popup_tree.node.setPosition(start.x, start.y);
+                        win.rendering_requested.x = start.x;
+                        win.rendering_requested.y = start.y;
+                        win.startWorkspaceAnimation(target, 1.0, duration, easing);
+                    }
+                }
+                self.raiseFloatingWindows();
                 self.updateFocusForWorkspace(new_id);
                 Nile.dirtyWindowing();
                 Nile.dirtyRendering();
@@ -689,9 +1159,23 @@ pub const NileCompositor = struct {
                     if (self.cur().*) |*rr| {
                         self.animateWorkspaceFadeIn(rr, output_box, duration, easing);
                     } else {
-                        // Empty incoming workspace — just fade out outgoing
+                        // Empty incoming workspace — just fade out outgoing (floating handled below)
                     }
                 }
+                // Incoming floating windows: fade in like tiled incoming
+                {
+                    var it2 = Nile.Window.iter();
+                    while (it2.next()) |win| {
+                        if (win.wm_requested.workspace != new_id) continue;
+                        if (!win.isEffectivelyFloating()) continue;
+                        if (win.state != .mapped) continue;
+                        self.ensureFloatingPosition(win);
+                        win.alpha = 0.0;
+                        win.applyAlpha(0.0);
+                        win.startWorkspaceAnimation(win.box, 1.0, duration, easing);
+                    }
+                }
+                self.raiseFloatingWindows();
                 self.updateFocusForWorkspace(new_id);
                 Nile.dirtyWindowing();
                 Nile.dirtyRendering();
@@ -807,6 +1291,7 @@ pub const NileCompositor = struct {
 
     /// A window moved between workspaces. Detach it from the old tree and
     /// attach it to the new one; both tilings otherwise untouched.
+    /// Floating windows are not placed in tiling trees.
     fn onWindowWorkspaceChanged(self: *NileCompositor, win: *Window, old_id: u64, new_id: u64) void {
         const old_root = self.rootFor(old_id);
         if (old_root.*) |*r| {
@@ -818,8 +1303,24 @@ pub const NileCompositor = struct {
                 }
             }
             if (old_root == self.cur()) {
-                if (old_root.*) |*rr| self.layoutTree(rr);
+                const old_mode = server.workspace.getEffectiveMode(old_id);
+                if (old_mode == .floating) {
+                    // Floating workspace: keep floating positions, don't retile
+                    self.layoutCurrent();
+                } else {
+                    if (old_root.*) |*rr| self.layoutTree(rr) else self.layoutCurrent();
+                }
             }
+        }
+        // Only insert into tiling tree if window is effectively tiled on new workspace
+        if (win.isEffectivelyFloating()) {
+            if (self.rootFor(new_id) == self.cur()) {
+                self.ensureFloatingPosition(win);
+                Nile.Window.raiseToTop(win);
+                self.raiseFloatingWindows();
+                Nile.dirtyRendering();
+            }
+            return;
         }
         const new_root = self.rootFor(new_id);
         if (new_root.*) |*r| {
@@ -831,6 +1332,7 @@ pub const NileCompositor = struct {
             new_root.* = .{ .leaf = win };
             if (new_root == self.cur()) self.layoutCurrent();
         }
+        self.raiseFloatingWindows();
     }
 
     /// Arrange all windows. Only builds a tree when the current workspace has
@@ -844,8 +1346,11 @@ pub const NileCompositor = struct {
     /// Attach any current-workspace windows missing from its tree (e.g. first
     /// show, or windows assigned while this policy wasn't registered).
     /// Existing splits/ratios are preserved — nothing is ever rebuilt here.
+    /// Floating windows (forced or workspace mode floating) are never added to the tiling tree.
     fn ensureCurrentTree(self: *NileCompositor) void {
         const current_ws = server.workspace.currentWorkspace();
+        const mode = server.workspace.getEffectiveMode(current_ws);
+        if (mode == .floating) return;
         const root = self.cur();
         if (root.* == null) {
             var wins = std.ArrayList(*Window).empty;
@@ -853,15 +1358,43 @@ pub const NileCompositor = struct {
             var it = Nile.Window.iter();
             while (it.next()) |win| {
                 if (win.wm_requested.workspace != current_ws) continue;
+                if (win.isEffectivelyFloating()) continue;
                 wins.append(self.gpa, win) catch unreachable;
             }
             if (wins.items.len == 0) return;
             root.* = construct(self.gpa, wins.items);
             return;
         }
+        // Prune floating windows that are lingering in tree (e.g. toggled while in tree)
+        {
+            var wins = std.ArrayList(*Window).empty;
+            defer wins.deinit(self.gpa);
+            // Collect floating windows that are in tree but should be removed
+            const r: *Node = &root.*.?;
+            // We cannot easily enumerate tree, so iterate all windows and check
+            var it = Nile.Window.iter();
+            while (it.next()) |win| {
+                if (win.wm_requested.workspace != current_ws) continue;
+                if (win.isEffectivelyFloating() and r.find(win) != null) {
+                    wins.append(self.gpa, win) catch unreachable;
+                }
+            }
+            for (wins.items) |win| {
+                if (r.find(win)) |n| {
+                    if (r.* == .leaf) {
+                        root.* = null;
+                        break;
+                    } else if (r.findParent(n)) |p| {
+                        p.pop(p.branch.first == n);
+                    }
+                }
+            }
+            if (root.* == null) return;
+        }
         var it = Nile.Window.iter();
         while (it.next()) |win| {
             if (win.wm_requested.workspace != current_ws) continue;
+            if (win.isEffectivelyFloating()) continue;
             const r: *Node = &root.*.?;
             if (r.find(win) != null) continue;
             const drop_x: i32 = @intCast(@max(0, win.box.x));
@@ -872,11 +1405,30 @@ pub const NileCompositor = struct {
 
     /// Apply the current workspace tree's geometry to its windows.
     fn layoutCurrent(self: *NileCompositor) void {
-        if (self.cur().*) |*r| self.layoutTree(r);
+        const cur_id = server.workspace.currentWorkspace();
+        const mode = server.workspace.getEffectiveMode(cur_id);
+        if (mode == .floating) {
+            // Floating workspace: ensure floating windows have positions, raise them
+            var it = Nile.Window.iter();
+            while (it.next()) |win| {
+                if (win.wm_requested.workspace != cur_id) continue;
+                if (win.state != .mapped) continue;
+                self.ensureFloatingPosition(win);
+            }
+            self.raiseFloatingWindows();
+            Nile.dirtyWindowing();
+            Nile.dirtyRendering();
+            return;
+        }
+        if (self.cur().*) |*r| self.layoutTree(r) else {
+            // No tiling tree but maybe floating windows need raise
+            self.raiseFloatingWindows();
+            Nile.dirtyRendering();
+        }
     }
 
     /// Apply one tree's geometry. Pure layout — never mutates the tree.
-    fn layoutTree(_: *NileCompositor, r: *Node) void {
+    fn layoutTree(self: *NileCompositor, r: *Node) void {
         const out = Nile.Output.primary() orelse return;
         const box = Nile.Layer.nonExclusiveArea(out);
         if (box.width == 0 or box.height == 0) return;
@@ -886,6 +1438,8 @@ pub const NileCompositor = struct {
             .w = @intCast(box.width),
             .h = @intCast(box.height),
         }, r, true);
+        // After tiling, raise any floating windows above tiled ones on this workspace
+        self.raiseFloatingWindows();
         Nile.dirtyWindowing();
         Nile.dirtyRendering();
     }
@@ -945,6 +1499,74 @@ pub const NileCompositor = struct {
         Nile.Window.setFullscreen(win, output);
     }
 
+    fn onMaximize(self: *NileCompositor, win: *Window, maximize: bool) void {
+        if (maximize) {
+            if (win.wm_requested.maximized) return;
+            // Save geometry for restore
+            win.maximize_prev_box = win.box;
+            const out = Nile.Output.primary() orelse return;
+            const nea = Nile.Layer.nonExclusiveArea(out);
+            if (nea.width == 0 or nea.height == 0) return;
+            // If tiled (in tree), pop it so tiling layout doesn't fight maximize
+            if (!win.isEffectivelyFloating()) {
+                const root = self.rootFor(win.wm_requested.workspace);
+                if (root.*) |*r| {
+                    if (r.find(win)) |n| {
+                        if (r.* == .leaf) {
+                            root.* = null;
+                        } else if (r.findParent(n)) |p| {
+                            p.pop(p.branch.first == n);
+                            if (root == self.cur()) self.layoutTree(r);
+                        }
+                    }
+                }
+            }
+            win.wm_requested.maximized = true;
+            // Maximize to output's non-exclusive area (floating-style)
+            Nile.Window.setPosition(win, nea.x, nea.y, false);
+            Nile.Window.setDimensions(win, @intCast(nea.width), @intCast(nea.height), false);
+            self.raiseFloatingWindows();
+            Nile.Window.raiseToTop(win);
+            Nile.dirtyWindowing();
+            Nile.dirtyRendering();
+        } else {
+            if (!win.wm_requested.maximized) return;
+            win.wm_requested.maximized = false;
+            if (win.maximize_prev_box) |prev| {
+                win.maximize_prev_box = null;
+                Nile.Window.setPosition(win, prev.x, prev.y, false);
+                Nile.Window.setDimensions(win, @intCast(prev.width), @intCast(prev.height), false);
+                // If it was tiled before maximize, reinsert into tiling tree
+                const ws_mode = server.workspace.getEffectiveMode(win.wm_requested.workspace);
+                if (ws_mode == .tiling and !win.floating) {
+                    const root = self.rootFor(win.wm_requested.workspace);
+                    var in_tree = false;
+                    if (root.*) |*r| {
+                        if (r.find(win) != null) in_tree = true;
+                    }
+                    if (!in_tree) {
+                        if (root.*) |*r| {
+                            const drop_x: i32 = @intCast(@max(0, prev.x));
+                            const drop_y: i32 = @intCast(@max(0, prev.y));
+                            r.append(self.gpa, win, drop_x, drop_y);
+                        } else {
+                            root.* = .{ .leaf = win };
+                        }
+                    }
+                    if (root == self.cur()) self.layoutCurrent();
+                }
+                self.raiseFloatingWindows();
+                // Keep focused window on top if it was the maximized one
+                if (win.isEffectivelyFloating()) Nile.Window.raiseToTop(win);
+                Nile.dirtyWindowing();
+                Nile.dirtyRendering();
+            } else {
+                win.wm_requested.maximized = false;
+                Nile.dirtyWindowing();
+            }
+        }
+    }
+
     fn onPointerButton(
         self: *NileCompositor,
         seat: *@import("Seat.zig"),
@@ -963,8 +1585,30 @@ pub const NileCompositor = struct {
             .pressed => switch (kind) {
                 .move => if (window) |win| {
                     log.info("pointer_button move pressed on {?s}", .{win.getTitle()});
-                    Nile.Seat.focusWindow(seat, win);
-                    Nile.Window.raiseToTop(win);
+                    seat.focus(.{ .window = win });
+                    // Maximized windows snap back to stored floating size on drag
+                    if (win.wm_requested.maximized) {
+                        const restore = win.floating_restore_box orelse win.maximize_prev_box orelse win.box;
+                        win.wm_requested.maximized = false;
+                        win.maximize_prev_box = null;
+                        win.ensureFloatingRestoreBox();
+                        const rbox = restore;
+                        Nile.Window.setPosition(win, rbox.x, rbox.y, false);
+                        if (rbox.width != 0 and rbox.height != 0) {
+                            Nile.Window.setDimensions(win, @intCast(rbox.width), @intCast(rbox.height), false);
+                        }
+                        win.floating_box = rbox;
+                        // Treat as floating for this drag
+                        Nile.Seat.opStartMove(seat, win);
+                        Nile.dirtyWindowing();
+                        Nile.dirtyRendering();
+                        return;
+                    }
+                    if (win.isEffectivelyFloating()) {
+                        Nile.Seat.opStartMove(seat, win);
+                        // Floating windows stay floating: don't touch tiling tree
+                        return;
+                    }
                     const cur_root = self.cur();
                     if (cur_root.* == null or cur_root.*.? == .leaf)
                         return;
@@ -972,18 +1616,39 @@ pub const NileCompositor = struct {
                     const n = cur_root.*.?.find(win) orelse return;
                     const p = cur_root.*.?.findParent(n) orelse return;
                     p.pop(p.branch.first == n);
+                    // Tiling drag: keep the grabbed window very front (behind shell/overlay)
+                    Nile.Window.raiseToTop(win);
+                    Nile.dirtyRendering();
                 },
                 .resize => if (window) |win| {
                     log.info("pointer_button resize pressed edges={} on {?s}", .{ edges, win.getTitle() });
-                    Nile.Seat.focusWindow(seat, win);
-                    Nile.Window.raiseToTop(win);
+                    seat.focus(.{ .window = win });
                     Nile.Window.setResizing(win, true);
+                    if (win.wm_requested.maximized) {
+                        const restore = win.floating_restore_box orelse win.maximize_prev_box orelse win.box;
+                        win.wm_requested.maximized = false;
+                        win.maximize_prev_box = null;
+                        win.ensureFloatingRestoreBox();
+                        const rbox = restore;
+                        Nile.Window.setPosition(win, rbox.x, rbox.y, false);
+                        if (rbox.width != 0 and rbox.height != 0) {
+                            Nile.Window.setDimensions(win, @intCast(rbox.width), @intCast(rbox.height), false);
+                        }
+                        win.floating_box = rbox;
+                        Nile.Seat.opStartResize(seat, win, edges);
+                        Nile.dirtyWindowing();
+                        Nile.dirtyRendering();
+                        return;
+                    }
+                    if (win.isEffectivelyFloating()) {
+                        Nile.Seat.opStartResize(seat, win, edges);
+                        return;
+                    }
                     Nile.Seat.opStartResize(seat, win, edges);
                 },
                 .normal => if (window) |win| {
-                    // Normal hold — focus clicked window
-                    Nile.Seat.focusWindow(seat, win);
-                    Nile.Window.raiseToTop(win);
+                    // Normal hold — focus clicked window immediately (stacking via focus_changed, not click)
+                    seat.focus(.{ .window = win });
                 },
             },
             .released => {
@@ -1011,44 +1676,66 @@ pub const NileCompositor = struct {
                 if (op_win) |win| {
                     if (op_kind == .resize) Nile.Window.setResizing(win, false);
                     log.info("pointer_button {s} released at {d:.0},{d:.0}", .{ @tagName(op_kind), x, y });
-                    const cur_root = self.cur();
-                    log.info("Nullability of root {}", .{(cur_root.* == null)});
-                    if (cur_root.*) |*r| {
-                        const drop_x: i32 = @as(i32, @intFromFloat(@floor(x)));
-                        const drop_y: i32 = @as(i32, @intFromFloat(@floor(y)));
-                        const target = if (Nile.Output.primary()) |out| blk: {
-                            const nea = Nile.Layer.nonExclusiveArea(out);
-                            const output_box: Box = .{ .x = @intCast(nea.x), .y = @intCast(nea.y), .w = @intCast(nea.width), .h = @intCast(nea.height) };
-                            break :blk r.getNodeAllocated(drop_x, drop_y, r, output_box);
-                        } else r.getNode(drop_x, drop_y);
-                        if (op_kind == .move) {
-                            target.append(self.gpa, win, drop_x, drop_y);
-                        }
-                        const win_node = r.find(win) orelse target;
-                        log.info("added moving window to the tree at drop {d},{d}\n\twindow is at node {} with parent {}", .{
-                            drop_x,
-                            drop_y,
-                            @intFromPtr(win_node),
-                            @intFromPtr(target),
-                        });
+                    // Floating windows don't participate in tiling tree reinsert (stacking via focus, not click)
+                    if (win.isEffectivelyFloating()) {
+                        // Keep floating position as-is; update stored floating size for maximize snap-back
+                        win.updateFloatingRestoreBox();
                     } else {
-                        log.info("set moving window as root", .{});
-                        cur_root.* = .{ .leaf = win };
+                        const cur_root = self.cur();
+                        log.info("Nullability of root {}", .{(cur_root.* == null)});
+                        if (cur_root.*) |*r| {
+                            const drop_x: i32 = @as(i32, @intFromFloat(@floor(x)));
+                            const drop_y: i32 = @as(i32, @intFromFloat(@floor(y)));
+                            const target = if (Nile.Output.primary()) |out| blk: {
+                                const nea = Nile.Layer.nonExclusiveArea(out);
+                                const output_box: Box = .{ .x = @intCast(nea.x), .y = @intCast(nea.y), .w = @intCast(nea.width), .h = @intCast(nea.height) };
+                                break :blk r.getNodeAllocated(drop_x, drop_y, r, output_box);
+                            } else r.getNode(drop_x, drop_y);
+                            if (op_kind == .move) {
+                                target.append(self.gpa, win, drop_x, drop_y);
+                            }
+                            const win_node = r.find(win) orelse target;
+                            log.info("added moving window to the tree at drop {d},{d}\n\twindow is at node {} with parent {}", .{
+                                drop_x,
+                                drop_y,
+                                @intFromPtr(win_node),
+                                @intFromPtr(target),
+                            });
+                        } else {
+                            log.info("set moving window as root", .{});
+                            cur_root.* = .{ .leaf = win };
+                        }
                     }
                 }
                 if (seat.op != null or op_info != null) Nile.Seat.opEnd(seat);
             },
             else => {},
         }
-        if (self.cur().*) |*r| {
-            const out = Nile.Output.primary() orelse return;
-            const box = Nile.Layer.nonExclusiveArea(out);
-            arrangeNode(.{
-                .x = @intCast(box.x),
-                .y = @intCast(box.y),
-                .w = @intCast(box.width),
-                .h = @intCast(box.height),
-            }, r, true);
+        // Re-layout only tiling part; floating windows stay in place but need raise
+        const cur_id = server.workspace.currentWorkspace();
+        const mode = server.workspace.getEffectiveMode(cur_id);
+        if (mode == .tiling) {
+            if (self.cur().*) |*r| {
+                const out = Nile.Output.primary() orelse return;
+                const box = Nile.Layer.nonExclusiveArea(out);
+                arrangeNode(.{
+                    .x = @intCast(box.x),
+                    .y = @intCast(box.y),
+                    .w = @intCast(box.width),
+                    .h = @intCast(box.height),
+                }, r, true);
+            }
+            self.raiseFloatingWindows();
+        } else {
+            self.raiseFloatingWindows();
+            Nile.dirtyRendering();
+        }
+        // Keep the grabbed tiling window very front (behind shell/overlay) while dragging
+        if (state == .pressed and kind == .move) {
+            if (seat.op) |op| if (op.window) |ref| if (ref.get()) |win| {
+                Nile.Window.raiseToTop(win);
+                Nile.dirtyRendering();
+            };
         }
     }
 
@@ -1078,6 +1765,33 @@ pub const NileCompositor = struct {
                     }
                 },
                 .resize => {
+                    // Floating windows resize directly via dimensions, not tiling ratios
+                    if (win.isEffectivelyFloating()) {
+                        var new_w: i32 = @intCast(op.win_width);
+                        var new_h: i32 = @intCast(op.win_height);
+                        var new_x: i32 = op.win_x;
+                        var new_y: i32 = op.win_y;
+                        const dx: i32 = @as(i32, @intFromFloat(x - @as(f64, @floatFromInt(op.start_x))));
+                        const dy: i32 = @as(i32, @intFromFloat(y - @as(f64, @floatFromInt(op.start_y))));
+                        if (op.edges.right) new_w = @max(80, @as(i32, @intCast(op.win_width)) + dx);
+                        if (op.edges.left) {
+                            new_w = @max(80, @as(i32, @intCast(op.win_width)) - dx);
+                            new_x = op.win_x + dx;
+                        }
+                        if (op.edges.bottom) new_h = @max(80, @as(i32, @intCast(op.win_height)) + dy);
+                        if (op.edges.top) {
+                            new_h = @max(80, @as(i32, @intCast(op.win_height)) - dy);
+                            new_y = op.win_y + dy;
+                        }
+                        if (op.edges.left or op.edges.top) {
+                            Nile.Window.setPosition(win, new_x, new_y, false);
+                        }
+                        win.wm_requested.dimensions = .{ .width = @intCast(new_w), .height = @intCast(new_h) };
+                        win.startSizeAnimation(new_w, new_h, false);
+                        Nile.dirtyWindowing();
+                        Nile.dirtyRenderingImmediate();
+                        return;
+                    }
                     const rnode: *Node = if (self.cur().*) |*r| r else return;
                     const n = rnode.find(win) orelse return;
 

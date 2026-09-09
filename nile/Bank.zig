@@ -90,7 +90,7 @@ fn makeCompositorWindow(win: *Window, alloc: Allocator) !protocols.Window {
         .output = out_id,
         .pid = @intCast(@max(0, win.unreliablePid())),
         .rect = .{ .x = win.box.x, .y = win.box.y, .width = @intCast(@max(0, win.box.width)), .height = @intCast(@max(0, win.box.height)) },
-        .floating = false,
+        .floating = win.isEffectivelyFloating(),
         .fullscreen = win.wm_requested.fullscreen != null,
         .focused = isWindowFocused(win),
         .urgent = false,
@@ -168,6 +168,12 @@ fn focusOrderEnsure(win: *Window) void {
 /// Drop `ref` from the list (window destroyed). Order of the rest is kept.
 fn focusOrderRemove(ref: Window.Ref) void {
     if (focusOrderIndexOf(ref)) |idx| _ = focus_order.orderedRemove(idx);
+}
+
+/// Public accessor for focus order (MRU first, index 0 = focused).
+/// Main-thread only: mutated from onCompositorEvent, read from request thread and compositor.
+pub fn focusOrderSlice() []const Window.Ref {
+    return focus_order.items;
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +596,11 @@ fn collectWorkspaces(alloc: Allocator) ![]protocols.Workspace {
         items.deinit(alloc);
     }
     for (ws_list) |ws| {
+        const eff_mode = ws.mode orelse server.workspace.default_mode;
+        const mode: protocols.WorkspaceMode = switch (eff_mode) {
+            .tiling => .tiling,
+            .floating => .floating,
+        };
         try items.append(alloc, .{
             .id = ws.id,
             .number = @truncate(ws.number),
@@ -598,6 +609,7 @@ fn collectWorkspaces(alloc: Allocator) ![]protocols.Workspace {
             .current = ws.current,
             .urgent = ws.urgent,
             .output = ws.output,
+            .mode = mode,
         });
     }
     return items.toOwnedSlice(alloc);
@@ -612,6 +624,11 @@ fn makeCompositorWorkspace(id: u64, alloc: Allocator) !?protocols.Workspace {
     }
     for (ws_list) |ws| {
         if (ws.id != id) continue;
+        const eff_mode = ws.mode orelse server.workspace.default_mode;
+        const mode: protocols.WorkspaceMode = switch (eff_mode) {
+            .tiling => .tiling,
+            .floating => .floating,
+        };
         return protocols.Workspace{
             .id = ws.id,
             .number = @truncate(ws.number),
@@ -620,6 +637,7 @@ fn makeCompositorWorkspace(id: u64, alloc: Allocator) !?protocols.Workspace {
             .current = ws.current,
             .urgent = ws.urgent,
             .output = ws.output,
+            .mode = mode,
         };
     }
     return null;
@@ -637,6 +655,9 @@ const AsyncOp = union(enum) {
     switch_workspace: u64,
     // `name` is heap-owned; freed on the main thread after applying.
     set_workspace_name: struct { id: u64, name: []u8 },
+    set_window_floating: struct { id: u64, floating: bool },
+    set_workspace_mode: struct { id: u64, mode: protocols.WorkspaceMode },
+    set_focus_config: struct { switch_workspace_on_focus: bool },
 };
 
 const DummyMutex = struct {
@@ -648,6 +669,19 @@ var async_queue: std.ArrayList(AsyncOp) = .empty;
 var pipe_fds: [2]posix.fd_t = .{ -1, -1 };
 var bank_event_source: ?*wl.EventSource = null;
 var bank_alloc: Allocator = undefined;
+
+/// When shell focuses a window on another workspace: if true (default)
+/// switch to that workspace and focus it (alt-tab anywhere, `only_current=false`);
+/// if false, stay on current workspace (shell filters to current only).
+/// Configurable via `set_focus_config` (nilebank) or `Nile` API.
+var focus_switches_workspace: bool = true;
+
+pub fn setFocusSwitchesWorkspace(v: bool) void {
+    focus_switches_workspace = v;
+}
+pub fn getFocusSwitchesWorkspace() bool {
+    return focus_switches_workspace;
+}
 
 fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
     // Drain pipe (single read, pipe is blocking but data is guaranteed)
@@ -663,10 +697,17 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
         switch (op) {
             .focus_window => |id| {
                 if (windowFromId(id)) |win| {
+                    const target_ws = win.wm_requested.workspace;
+                    const cur_ws = server.workspace.currentWorkspace();
+                    if (target_ws != cur_ws and focus_switches_workspace) {
+                        _ = server.workspace.switchWorkspace(target_ws) catch |err| {
+                            log.warn("bank: focus window {d} switch to workspace {d} failed: {}", .{ id, target_ws, err });
+                        };
+                    }
                     const seat = server.input_manager.defaultSeat();
                     seat.wm_requested.focus = .{ .window = win.ref };
                     server.wm.dirtyWindowing();
-                    log.info("bank: focus window {d}", .{id});
+                    log.info("bank: focus window {d} (ws {d} -> cur {d} switch={})", .{ id, target_ws, cur_ws, focus_switches_workspace });
                 } else {
                     log.warn("bank: focus window {d}: unknown id", .{id});
                 }
@@ -713,6 +754,28 @@ fn handlePipe(_: c_int, _: wl.EventMask, _: ?*anyopaque) c_int {
                 server.workspace.setWorkspaceName(bank_alloc, v.id, v.name) catch |err| {
                     log.warn("bank: rename workspace {d} failed: {}", .{ v.id, err });
                 };
+            },
+            .set_window_floating => |v| {
+                if (windowFromId(v.id)) |win| {
+                    win.setFloating(v.floating);
+                    log.info("bank: set window {d} floating={any}", .{ v.id, v.floating });
+                } else {
+                    log.warn("bank: set window {d} floating: unknown id", .{v.id});
+                }
+            },
+            .set_workspace_mode => |v| {
+                const mode: @import("Workspace.zig").Mode = switch (v.mode) {
+                    .tiling => .tiling,
+                    .floating => .floating,
+                };
+                server.workspace.setWorkspaceMode(v.id, mode) catch |err| {
+                    log.warn("bank: set workspace {d} mode failed: {}", .{ v.id, err });
+                };
+                log.info("bank: set workspace {d} mode={s}", .{ v.id, @tagName(mode) });
+            },
+            .set_focus_config => |v| {
+                focus_switches_workspace = v.switch_workspace_on_focus;
+                log.info("bank: set focus_config switch_workspace_on_focus={}", .{focus_switches_workspace});
             },
         }
     }
@@ -779,6 +842,11 @@ fn bankCallback(_: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Message
         .get_workspace => |v| blk: {
             if (server.workspace.getWorkspace(v.id, alloc)) |ws| {
                 defer ws.deinit(alloc);
+                const eff_mode = ws.mode orelse server.workspace.default_mode;
+                const mode: protocols.WorkspaceMode = switch (eff_mode) {
+                    .tiling => .tiling,
+                    .floating => .floating,
+                };
                 const items = try alloc.alloc(protocols.Workspace, 1);
                 items[0] = .{
                     .id = ws.id,
@@ -788,6 +856,7 @@ fn bankCallback(_: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Message
                     .current = ws.current,
                     .urgent = ws.urgent,
                     .output = ws.output,
+                    .mode = mode,
                 };
                 break :blk .{ .workspaces = .{ .items = items } };
             } else {
@@ -875,6 +944,18 @@ fn bankCallback(_: ?*anyopaque, msg: nilebank.Message) anyerror!nilebank.Message
             log.info("bank: shell registered as '{s}'", .{owned});
             break :blk .{ .pong = .{ .nonce = 0 } };
         },
+        .set_window_floating => |v| blk: {
+            queueAsync(.{ .set_window_floating = .{ .id = v.id, .floating = v.floating } });
+            break :blk .{ .pong = .{ .nonce = v.id } };
+        },
+        .set_workspace_mode => |v| blk: {
+            queueAsync(.{ .set_workspace_mode = .{ .id = v.id, .mode = v.mode } });
+            break :blk .{ .pong = .{ .nonce = v.id } };
+        },
+        .set_focus_config => |v| blk: {
+            queueAsync(.{ .set_focus_config = .{ .switch_workspace_on_focus = v.switch_workspace_on_focus } });
+            break :blk .{ .pong = .{ .nonce = 0 } };
+        },
         .full_image, .window_image => .{
             .error_msg = .{ .code = 3, .message = try alloc.dupe(u8, "legacy image not implemented, use capture_*") },
         },
@@ -946,7 +1027,7 @@ fn windowIdOrZero(win: ?*Window) u64 {
 fn windowStateEvent(win: *Window) protocols.Event {
     return .{ .window_state_changed = .{
         .id = windowIdFromRef(win.ref),
-        .floating = false,
+        .floating = win.isEffectivelyFloating(),
         .fullscreen = win.wm_requested.fullscreen != null,
         .urgent = false,
         .focused = isWindowFocused(win),
@@ -1067,6 +1148,24 @@ fn onCompositorEvent(event: Compositor.Event) void {
             // No dedicated rename event in the protocol; push a full snapshot instead.
             const items = collectWorkspaces(bank_alloc) catch return;
             broadcast(.{ .workspaces_snapshot = .{ .items = items } });
+        },
+        .workspace_mode_changed => |v| {
+            const mode: protocols.WorkspaceMode = switch (v.mode) {
+                .tiling => .tiling,
+                .floating => .floating,
+            };
+            broadcast(.{ .workspace_mode_changed = .{ .id = v.id, .mode = mode } });
+            // Also broadcast window_state for all windows on this workspace (effective floating changed)
+            var it = server.wm.windows.iterator();
+            while (it.next()) |win| {
+                if (win.wm_requested.workspace != v.id) continue;
+                // Those with forced floating false change effective state when workspace mode toggles
+                if (!win.floating) broadcast(windowStateEvent(win));
+            }
+        },
+        .window_floating_changed => |win| {
+            broadcast(.{ .window_floating_changed = .{ .id = windowIdFromRef(win.ref), .floating = win.floating } });
+            broadcast(windowStateEvent(win));
         },
     }
 }
